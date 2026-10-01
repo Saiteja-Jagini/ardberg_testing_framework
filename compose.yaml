@@ -1,0 +1,48 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ardberg
+      POSTGRES_PASSWORD: ardberg_local
+      POSTGRES_DB: ardberg
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ardberg"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  temporal:
+    image: temporalio/auto-setup:latest
+    environment:
+      DB: postgres12
+      DB_PORT: 5432
+      POSTGRES_SEEDS: postgres
+      POSTGRES_USER: ardberg
+      POSTGRES_PWD: ardberg_local
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:7233:7233"
+
+  temporal-ui:
+    image: temporalio/ui:latest
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+    depends_on:
+      - temporal
+    ports:
+      - "127.0.0.1:8088:8080"
+
+  runner-image:
+    image: ardberg-runner:local
+    build:
+      context: ./runner
+    profiles: ["build"]
+
+volumes:
+  pgdata:

@@ -4,7 +4,7 @@
 
 Build a minimal Next.js frontend and Python backend that accepts a GitHub repository or PR link, lets a user say exactly what to test, generates tests, runs them in a local isolated environment, investigates failures, and publishes an agent-written review in the dashboard and on the GitHub PR.
 
-This version records the implementation choices provided by the user. It is a plan; no application code has been implemented yet.
+This plan records the implementation choices provided by the user. The corresponding application code is in \`frontend/\`, \`backend/\`, and \`runner/\`; setup and verification instructions are in \`README.md\`.
 
 ## 1. Selected decisions
 
@@ -19,12 +19,12 @@ This version records the implementation choices provided by the user. It is a pl
 | Durable orchestration | **Temporal** owns the run lifecycle, parallel branches, cancellation, retries, and recovery. |
 | Applicability | Attempt an **adapter** when an enabled agent does not directly fit the repository. If no valid adapter exists, that agent fails and global fail-fast applies. |
 | Generated tests | Agents return **patches only**. Patches are validated and applied in an isolated local checkout for execution. |
-| Test publication | Keep generated test patches as **run artifacts**. Never commit them to the PR branch. |
+| Test publication | **Revised by the user's latest instruction:** keep patch artifacts and commit validated generated test files to the PR branch after all suites pass. Failed runs retain artifacts without a commit. |
 | Runner | Execute repository code and browser tests in **local isolated containers** on our infrastructure. |
 | Suite scheduling | **Parallel suite nodes inside the Test Execution Agent**; the agent's surrounding stages stay sequential. |
 | Failure investigation | **Rules-based classification** using recorded execution facts. |
 | Final report | A **report-writing agent** generates the full analysis from evidence. No deterministic prose template. |
-| Report destinations | Show results in the **dashboard and on the GitHub PR** through a check run and an updated PR comment; no repository files are changed. |
+| Report destinations | Show results in the **dashboard and on the GitHub PR** through a check run and an updated PR comment. Validated generated test files are committed to the PR branch after all suites pass. |
 
 The choices of GitHub check plus PR comment, Server-Sent Events for UI updates, PostgreSQL for run data, and local artifact files resolve previously unselected details with feasible initial implementations.
 
@@ -74,7 +74,7 @@ Every node that actually executes returns `success: true` or `success: false` wi
 
 Verify webhook signatures, deduplicate delivery IDs, and prevent an older run from replacing the current PR check or comment. A submitted link performs the initial API fetch; the GitHub App installation enables later webhook deliveries. See [GitHub App webhooks](https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/using-webhooks-with-github-apps), [PR webhook events](https://docs.github.com/en/webhooks/webhook-events-and-payloads), and [webhook validation](https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries).
 
-The app will request only the permissions needed to read repository contents and PR data and to write the selected check and PR report. Generated tests never require repository-content write permission. GitHub check runs require a GitHub App with Checks write permission. See [GitHub App permissions](https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/choosing-permissions-for-a-github-app) and [check runs](https://docs.github.com/en/rest/checks/runs).
+The app needs repository Contents write permission for the newly requested generated-test commit, plus PR read/write and Checks write permissions for reporting. See [GitHub App permissions](https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/choosing-permissions-for-a-github-app) and [check runs](https://docs.github.com/en/rest/checks/runs).
 
 **Local deployment constraint:** GitHub must reach the webhook endpoint over the internet. For local development, expose the local FastAPI webhook through an HTTPS tunnel; for a persistent deployment, use a public HTTPS ingress. Test execution can still remain on the local machine.
 
@@ -138,7 +138,7 @@ The Test Execution Agent's stages are:
 2. Install dependencies and start required services.
 3. Fan out **parallel suite nodes** for applicable built-in, Playwright, and Vitest commands.
 4. On the first suite failure, cancel sibling suites and stop later execution work.
-5. If all suites pass, collect their structured results and artifacts.
+5. If all suites pass, collect their structured results and artifacts, then commit validated generated test files to the pinned PR head with a non-force update. Failed runs keep patches as artifacts.
 
 The suite fan-out is the deliberate exception to sequential execution inside the Test Execution Agent. Its outer stages remain sequential. Each suite node still returns its own Boolean result. Playwright traces and Vitest machine-readable reports provide evidence for their respective suites. See [Playwright traces](https://playwright.dev/docs/trace-viewer) and [Vitest reporters](https://vitest.dev/guide/reporters).
 
@@ -150,7 +150,7 @@ The **Report Generation Agent** runs after success or failure finalization. It r
 
 The agent writes the complete report narrative without a fixed prose template. Its output must still include the tested commit, detected and selected frameworks, tests generated and run, pass/fail/cancelled counts, findings, evidence links, limitations, and uncovered user requests. A structured report record supports the UI and GitHub publishing. Unsupported claims fail report verification and return to the writing node for correction within a bounded retry limit.
 
-Publish the report to the dashboard, a GitHub check run on the tested head commit, and one bot comment on the PR that is updated for a newer run. The check and comment link to the dashboard's evidence. Publishing does **not** commit test code or any other file to the PR branch.
+Publish the report to the dashboard, a GitHub check run on the current tested PR head, and one bot comment on the PR that is updated for a newer run. The check and comment link to the dashboard's evidence. The generated-test commit changes only validated test paths after successful suite execution; a failed run leaves the PR branch as it was.
 
 ## 8. Minimal UI, API, and storage
 
