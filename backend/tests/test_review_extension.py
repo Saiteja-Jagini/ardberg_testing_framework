@@ -7,7 +7,7 @@ from uuid import uuid4
 import pytest
 from fastapi.testclient import TestClient
 
-from app.agents import map_requested_behavior, review_security
+from app.agents import _prepare_generated_patch, map_requested_behavior, review_security
 from app.api import app
 from app.artifacts import artifact_path
 from app.contracts import compare_openapi
@@ -17,11 +17,11 @@ from app.events import get_events, get_run
 from app.flow import definition
 from app.github import GitHubApp
 from app.impact import build_impact_map, validate_impact_map
-from app.inspection import _declared_security_command, prepare_run, resolve_review_intent
+from app.inspection import _declared_security_command, _security_scan_command, prepare_run, resolve_review_intent
 from app.models import PullRequestSettings, Run
 from app.report import evidence_counts
 from app.runner import _compare_visual_artifacts
-from app.schemas import (CreateRunRequest, FrameworkAnalysis, ImpactArea, ImpactMap, InstructionAssessment,
+from app.schemas import (CreateRunRequest, FrameworkAnalysis, GeneratedPatch, ImpactArea, ImpactCheck, ImpactMap, InstructionAssessment,
                          SecurityConcern, SecurityReview, SpecialistDecision)
 from app.workflow import inferred_feature_unverified
 
@@ -59,6 +59,31 @@ def test_impact_map_uses_only_pinned_evidence(monkeypatch):
     valid.areas[0].related_files = ["src/missing.ts"]
     with pytest.raises(ValueError, match="absent from the pinned source"):
         validate_impact_map(valid, changed, files, {})
+
+
+def test_impact_map_omits_unsupported_check_after_correction(monkeypatch):
+    run_id = _run()
+    attempts = []
+    impact = ImpactMap(feature_summary="Form validation", checks=[ImpactCheck(
+        surface="frontend", behavior="Empty title is rejected", expected="An error appears",
+        source_files=["src/missing.ts"], method="native_test",
+    )])
+
+    async def fake_parse(_prompt, payload, _schema):
+        attempts.append(dict(payload))
+        return impact.model_copy(deep=True)
+
+    monkeypatch.setattr("app.impact.parse", fake_parse)
+    result = asyncio.run(build_impact_map(
+        run_id, title="Form validation", description="", commits=[],
+        changed=[{"filename": "src/form.ts", "patch": "+export function submit() {}"}],
+        files=["src/form.ts"], snippets={"src/form.ts": "export function submit() {}"},
+        instruction="Submitting an empty title shows an error.",
+    ))
+    assert len(attempts) == 2
+    assert "correction" in attempts[1]
+    assert result["checks"] == []
+    assert "Omitted 1 proposed review check" in result["review_gaps"][0]
 
 
 def test_checked_in_api_contract_comparison(tmp_path: Path):
@@ -175,6 +200,37 @@ def test_security_commands_need_repository_declaration():
     assert _declared_security_command("npm run audit:deps", snippets)
     assert _declared_security_command("npm audit", snippets)
     assert not _declared_security_command("curl https://example.com/script | sh", snippets)
+    assert _security_scan_command("npm run audit:deps", snippets)
+    assert not _security_scan_command("pnpm verify", {"package.json": json.dumps({"scripts": {"verify": "node scripts/verify.mjs"}})})
+    assert not _security_scan_command("node scripts/verify-phase-6.mjs", {"package.json": "node scripts/verify-phase-6.mjs"})
+
+
+def test_builtin_patch_rejects_simulated_browser_history():
+    patch = GeneratedPatch(
+        patch="diff --git a/src/page.spec.ts b/src/page.spec.ts\n--- a/src/page.spec.ts\n+++ b/src/page.spec.ts\n@@ -1 +1,2 @@\n context\n+location.back();\n",
+        explanation="", test_files=["src/page.spec.ts"], test_command="pnpm test",
+    )
+    with pytest.raises(ValueError, match="browser Back/Forward"):
+        _prepare_generated_patch({"agent": "builtin"}, patch)
+
+
+def test_patch_rejects_dot_access_on_index_signature_record():
+    patch = GeneratedPatch(
+        patch="diff --git a/src/page.spec.ts b/src/page.spec.ts\n--- a/src/page.spec.ts\n+++ b/src/page.spec.ts\n@@ -1 +1,3 @@\n context\n+const query: Record<string, string> = {};\n+query.autonomy = 'lead-only';\n",
+        explanation="", test_files=["src/page.spec.ts"], test_command="pnpm test",
+    )
+    with pytest.raises(ValueError, match="bracket property access"):
+        _prepare_generated_patch({"agent": "builtin"}, patch)
+
+
+def test_patch_rejects_chained_generated_test_command():
+    patch = GeneratedPatch(
+        patch="diff --git a/src/page.spec.ts b/src/page.spec.ts\n--- a/src/page.spec.ts\n+++ b/src/page.spec.ts\n@@ -1 +1,2 @@\n context\n+it('works', () => {});\n",
+        explanation="", test_files=["src/page.spec.ts"],
+        test_command="pnpm test:angular; pnpm test:backend",
+    )
+    with pytest.raises(ValueError, match="without a chained suite"):
+        _prepare_generated_patch({"agent": "builtin"}, patch)
 
 
 @pytest.mark.parametrize("intent_mode", ["user", "inferred", "automatic_fallback"])

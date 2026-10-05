@@ -69,11 +69,26 @@ async def build_impact_map(run_id: str, *, title: str, description: str,
         impact = await parse(IMPACT_PROMPT, payload, ImpactMap)
         try:
             validate_impact_map(impact, changed, files, snippets)
-            result = impact.model_dump()
-            write_artifact(run_id, "context/impact-map.json", json.dumps(result, indent=2))
-            return result
         except ValueError as exc:
-            if attempt:
+            if not attempt:
+                payload["correction"] = str(exc)
+                continue
+            if str(exc) != "Review check needs behavior, expected result, and source evidence":
                 raise
-            payload["correction"] = str(exc)
+            evidence = {item["filename"] for item in changed} | set(snippets)
+            valid_checks = [check for check in impact.checks if check.behavior.strip()
+                            and check.expected.strip() and check.source_files
+                            and all(path in evidence for path in check.source_files)]
+            omitted = len(impact.checks) - len(valid_checks)
+            if not omitted:
+                raise
+            impact.checks = valid_checks
+            impact.review_gaps.append(
+                f"Omitted {omitted} proposed review check(s) without a behavior, "
+                "expected result, or source evidence after a correction attempt."
+            )
+            validate_impact_map(impact, changed, files, snippets)
+        result = impact.model_dump()
+        write_artifact(run_id, "context/impact-map.json", json.dumps(result, indent=2))
+        return result
     raise RuntimeError("Impact mapping did not finish")

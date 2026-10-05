@@ -48,6 +48,8 @@ Prerequisites: Python 3.11+, Node.js 20+, Docker Desktop with Linux containers, 
 
 6. Open http://127.0.0.1:3000. Enter a repository or PR URL. The free-text testing intent is optional: leave it blank to infer the changed feature from pinned PR evidence and run available checks. Choose Playwright and/or Vitest only when the repository has no native test framework.
 
+   The API accepts the configured frontend port from both `localhost` and `127.0.0.1`. If Next.js uses another port or hostname, set `FRONTEND_ORIGIN` in `.env` to that browser address and restart the API.
+
 GitHub must be able to reach the webhook at /webhooks/github over public HTTPS. For local development, use an HTTPS tunnel that exposes only this webhook path. The dashboard and API are intended to stay on localhost. Set PUBLIC_DASHBOARD_URL only when the dashboard is reachable by PR reviewers.
 
 ## Behavior

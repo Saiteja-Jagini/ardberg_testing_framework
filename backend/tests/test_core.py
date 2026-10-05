@@ -10,6 +10,7 @@ from uuid import uuid4
 import json
 import zipfile
 from urllib.error import HTTPError
+from urllib.parse import urlsplit
 
 import pytest
 from sqlalchemy import delete
@@ -18,6 +19,7 @@ from fastapi.testclient import TestClient
 from app import github
 from app.agents import _patch_paths, _test_path, build_agent_graph, generate_patch, select_commands
 from app.api import app
+from app.config import settings
 from app.artifacts import write_artifact
 from app.db import init_db, session_scope
 from app.events import emit, get_events, get_run, set_run
@@ -342,6 +344,18 @@ def test_report_receives_actual_failure_log(tmp_path: Path):
     assert "AssertionError" in from_error[relative]
 
 
+def test_report_receives_full_suite_summary_from_long_log():
+    run_id = new_run()
+    relative = write_artifact(run_id, "logs/builtin-2.log",
+                              "suite started\n" + "passing case\n" * 3_000 +
+                              "Test Files  60 passed (60)\nTests  420 passed (420)\n")
+    excerpt = evidence_artifact_excerpts(run_id, [{"detail": {"log": relative}}])[relative]
+    assert len(excerpt) <= 20_000
+    assert "suite started" in excerpt
+    assert "[middle of log omitted]" in excerpt
+    assert "Tests  420 passed (420)" in excerpt
+
+
 def test_builtin_patch_separates_modified_tests_from_existing_suite(monkeypatch):
     run_id = new_run()
     patch = (
@@ -439,6 +453,43 @@ def test_patch_generator_repairs_rejected_unified_diff(monkeypatch):
     assert result["patch"]["patch"] == valid
     assert len(attempts) == 2
     assert "header" in attempts[1]
+
+
+def test_patch_generator_retries_when_diff_does_not_apply(monkeypatch, tmp_path):
+    run_id = new_run()
+    source = tmp_path / "source"
+    test_file = source / "tests" / "test_existing.py"
+    test_file.parent.mkdir(parents=True)
+    test_file.write_text("assert True\n", encoding="utf-8")
+    valid = (
+        "diff --git a/tests/test_existing.py b/tests/test_existing.py\n"
+        "--- a/tests/test_existing.py\n"
+        "+++ b/tests/test_existing.py\n"
+        "@@ -1 +1 @@\n"
+        "-assert True\n"
+        "+assert 1\n"
+    )
+    attempts = []
+
+    async def fake_parse(_prompt, payload, _schema):
+        attempts.append(payload.get("correction"))
+        return GeneratedPatch(
+            patch=valid if len(attempts) > 1 else valid.replace("-assert True", "-assert Missing"),
+            explanation="Exercise the existing test", test_files=["tests/test_existing.py"],
+            test_command="pytest tests/test_existing.py",
+        )
+
+    monkeypatch.setattr("app.agents.parse", fake_parse)
+    result = asyncio.run(generate_patch({
+        "run_id": run_id, "agent": "builtin",
+        "plan": {"cases": [{"title": "Existing case", "patch_location": "tests/test_existing.py"}],
+                 "uncovered": []},
+        "context": {"instruction": "Check the existing test", "files": ["tests/test_existing.py"],
+                    "snippets": {}, "analysis": {}, "source_path": str(source)},
+    }))
+    assert result["patch"]["patch"] == valid
+    assert len(attempts) == 2
+    assert "git apply --check failed" in attempts[1]
 
 
 def test_publication_commits_validated_checkout_files(monkeypatch):
@@ -695,6 +746,28 @@ def test_api_health_and_reference_flow():
         assert result.status_code == 200
         assert len(result.json()["nodes"]) > 20
         assert client.get("/api/runs").status_code == 200
+
+
+def test_local_frontend_cors_preflight():
+    parsed = urlsplit(settings.frontend_origin)
+    assert parsed.hostname in {"localhost", "127.0.0.1"}
+    assert parsed.port is not None
+    with TestClient(app) as client:
+        for path in ("/api/resolve", "/api/runs"):
+            for host in ("localhost", "127.0.0.1"):
+                origin = f"{parsed.scheme}://{host}:{parsed.port}"
+                response = client.options(path, headers={
+                    "Origin": origin,
+                    "Access-Control-Request-Method": "POST",
+                    "Access-Control-Request-Headers": "content-type",
+                })
+                assert response.status_code == 200
+                assert response.headers["access-control-allow-origin"] == origin
+            blocked = client.options(path, headers={
+                "Origin": f"{parsed.scheme}://localhost:{parsed.port + 1}",
+                "Access-Control-Request-Method": "POST",
+            })
+            assert blocked.status_code == 400
 
 
 def test_webhook_reuses_instruction_for_new_head_and_deduplicates_delivery(monkeypatch):

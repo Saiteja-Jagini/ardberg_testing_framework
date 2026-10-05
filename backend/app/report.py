@@ -23,6 +23,21 @@ VERIFIER_PROMPT = (
 DOCUMENT_SUFFIXES = {".md", ".mdx", ".rst", ".adoc", ".txt"}
 
 
+def _artifact_excerpt(artifact: Path, limit: int) -> str:
+    with artifact.open("r", encoding="utf-8", errors="replace") as stream:
+        head = stream.read(limit + 1)
+    if len(head) <= limit or artifact.suffix.lower() != ".log":
+        return head[:limit]
+    marker = "\n... [middle of log omitted] ...\n"
+    tail_budget = min(4_000, max(0, (limit - len(marker)) // 2))
+    if not tail_budget:
+        return head[:limit]
+    with artifact.open("rb") as stream:
+        stream.seek(-min(8_000, artifact.stat().st_size), 2)
+        tail = stream.read().decode("utf-8", errors="replace")[-tail_budget:]
+    return head[:limit - len(marker) - len(tail)] + marker + tail
+
+
 def changed_document_context(context: dict) -> list[dict]:
     source_path = context.get("source_path")
     source = Path(source_path).resolve() if source_path else None
@@ -70,10 +85,8 @@ def evidence_artifact_excerpts(run_id: str, events: list[dict]) -> dict[str, str
                 ".txt", ".log", ".json", ".md", ".diff", ".sql",
             }:
                 continue
-            with artifact.open("r", encoding="utf-8", errors="replace") as stream:
-                content = stream.read(min(20_001, remaining + 1))
             limit = min(20_000, remaining)
-            excerpts[relative] = content[:limit]
+            excerpts[relative] = _artifact_excerpt(artifact, limit)
             remaining -= len(excerpts[relative])
         except (OSError, ValueError):
             continue
@@ -266,9 +279,7 @@ async def generate_report(run_id: str, outcome: dict) -> str:
             for path in claimed_artifacts:
                 artifact = artifact_path(run_id, path)
                 if artifact.suffix.lower() in {".txt", ".log", ".json", ".md", ".diff", ".sql"}:
-                    artifact_excerpts[path] = artifact.read_text(
-                        encoding="utf-8", errors="replace"
-                    )[:20000]
+                    artifact_excerpts[path] = _artifact_excerpt(artifact, 20_000)
             verification = await parse(VERIFIER_PROMPT, {
                 "report": draft.model_dump(), "events": events,
                 "outcome": outcome, "classifications": classifications,

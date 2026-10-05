@@ -140,6 +140,15 @@ def _declared_security_command(command: str, snippets: dict[str, str]) -> bool:
     return False
 
 
+def _security_scan_command(command: str, snippets: dict[str, str]) -> bool:
+    if not _declared_security_command(command, snippets):
+        return False
+    return bool(re.search(
+        r"(?i)(?:^|[\s/:_-])(?:audit|security|sast|sca|secret|vuln|scan|semgrep|trivy|snyk|osv|gitleaks)(?:$|[\s/:_.-])",
+        command,
+    ))
+
+
 def _review_command_evidenced(command: str, snippets: dict[str, str],
                              files: list[str]) -> bool:
     if _declared_security_command(command, snippets):
@@ -316,11 +325,11 @@ async def analyze_repository(repository: str, changed: list[dict], source: Path,
         if unverified:
             decision.reason += " Unverified repository paths were excluded: " + ", ".join(unverified)
     rejected_scans = [command for command in analysis.security_check_commands
-                      if not _declared_security_command(command, snippets)]
+                      if not _security_scan_command(command, snippets)]
     analysis.security_check_commands = [command for command in analysis.security_check_commands
-                                        if _declared_security_command(command, snippets)][:4]
+                                        if _security_scan_command(command, snippets)][:4]
     if rejected_scans:
-        analysis.explanation += " Unverified security scan commands were excluded."
+        analysis.explanation += " Commands without a declared security scan were excluded."
     return analysis, files, snippets
 
 

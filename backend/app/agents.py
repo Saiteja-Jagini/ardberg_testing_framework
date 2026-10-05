@@ -216,7 +216,14 @@ async def generate_patch(state: AgentState) -> dict:
         "run by a suite command must not appear in test_files. "
         "If a planned case cannot be implemented from actual repository APIs and fixtures, "
         "put its exact title and a concrete reason in uncovered_cases. Do not invent fixtures. "
+        "Native component tests may verify route-state emissions, but must not use simulated "
+        "Location.back(), Location.forward(), or history.back()/forward() to claim actual browser "
+        "history coverage. Leave real browser-history cases uncovered without a browser fixture. "
+        "For TypeScript Record<string, ...> values, use bracket property access such as "
+        "query['autonomy']; strict repositories may reject query.autonomy. "
         "Also provide the exact command to run the generated tests. "
+        "The generated-test command must be a single command; do not chain a second suite "
+        "with semicolons, &&, ||, or pipes. Existing repository suites are selected separately. "
         "Specialist commands must invoke playwright or vitest by name and target the generated test files; "
         "the executor adds machine-readable reporter flags. "
         "The patch will be checked with git apply --check; an invalid patch fails the run.")
@@ -226,13 +233,16 @@ async def generate_patch(state: AgentState) -> dict:
                "instruction_source": context.get("instruction_source", "user"),
                "impact_map": context.get("impact_map", {}),
                "security_review": state.get("security_review", {})}
-    for attempt in range(2):
+    for attempt in range(3):
         generated = await parse(prompt, payload, GeneratedPatch)
+        # Models sometimes indent a second diff section as if it were hunk context.
+        # The subsequent path and git-apply checks still validate the full patch.
+        generated.patch = re.sub(r"(?m)^ (?=diff --git a/)", "", generated.patch)
         try:
             plan = _prepare_generated_patch(state, generated)
             break
         except ValueError as exc:
-            if attempt:
+            if attempt == 2:
                 raise
             relative = write_artifact(
                 state["run_id"], f"patches/{state['agent']}-rejected.diff", generated.patch,
@@ -255,6 +265,27 @@ async def generate_patch(state: AgentState) -> dict:
 def _prepare_generated_patch(state: AgentState, generated: GeneratedPatch) -> dict:
     if not generated.patch.strip() or not generated.test_files or not generated.test_command.strip():
         raise ValueError("Model did not provide a test patch, files, and execution command")
+    if any(token in generated.test_command for token in (";", "&&", "||", "|", "\n", "\r")):
+        raise ValueError("Generated test command must be one command without a chained suite")
+    if state["agent"] == "builtin" and any(re.search(
+        r"\b(?:location|history)\.(?:back|forward)\s*\(", line, re.IGNORECASE,
+    ) for line in generated.patch.splitlines() if line.startswith("+") and not line.startswith("+++")):
+        raise ValueError(
+            "Native TestBed tests cannot establish actual browser Back/Forward behavior. "
+            "Use supported route-state emissions and mark real browser history uncovered."
+        )
+    added_lines = "\n".join(line[1:] for line in generated.patch.splitlines()
+                            if line.startswith("+") and not line.startswith("+++"))
+    indexed_records = set(re.findall(
+        r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*:\s*Record\s*<\s*string\s*,",
+        added_lines,
+    ))
+    for name in indexed_records:
+        if re.search(rf"\b{re.escape(name)}\.[A-Za-z_$][\w$]*", added_lines):
+            raise ValueError(
+                f"Use bracket property access for {name}: Record<string, ...> "
+                "may have noPropertyAccessFromIndexSignature enabled."
+            )
     actual_paths = _patch_paths(generated.patch)
     declared_paths = set(generated.test_files)
     if not actual_paths <= declared_paths:
@@ -290,6 +321,15 @@ def _prepare_generated_patch(state: AgentState, generated: GeneratedPatch) -> di
     if not retained_cases:
         raise ValueError("Generated patch covers none of the planned cases")
     plan["cases"] = retained_cases
+    source_path = state["context"].get("source_path")
+    if source_path:
+        result = subprocess.run(
+            ["git", "apply", "--check", "-"], cwd=source_path,
+            input=generated.patch.encode("utf-8"), capture_output=True, timeout=20,
+        )
+        if result.returncode:
+            raise ValueError("git apply --check failed: " +
+                             result.stderr.decode(errors="replace").strip()[:1000])
     generated.test_files = sorted(actual_paths)
     return plan
 

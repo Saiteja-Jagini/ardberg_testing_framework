@@ -3,6 +3,7 @@ import json
 import re
 from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Request
@@ -36,7 +37,19 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(title="Ardberg PR testing", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=[settings.frontend_origin],
+
+
+def frontend_origins() -> list[str]:
+    configured = settings.frontend_origin.rstrip("/")
+    origins = {configured}
+    parsed = urlsplit(configured)
+    if parsed.hostname in {"localhost", "127.0.0.1"} and parsed.port is not None:
+        origins.update({f"{parsed.scheme}://localhost:{parsed.port}",
+                        f"{parsed.scheme}://127.0.0.1:{parsed.port}"})
+    return sorted(origins)
+
+
+app.add_middleware(CORSMiddleware, allow_origins=frontend_origins(),
                    allow_methods=["GET", "POST"], allow_headers=["*"])
 
 
