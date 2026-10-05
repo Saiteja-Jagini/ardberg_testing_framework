@@ -1,5 +1,6 @@
 import asyncio
 import json
+import hashlib
 import os
 import re
 import secrets
@@ -54,21 +55,27 @@ async def _command(*args: str, timeout: int = 120) -> tuple[int, str]:
     return process.returncode or 0, output.decode("utf-8", errors="replace")[-1_000_000:]
 
 
-def _apply_patches(workspace: Path, results: list[dict]):
+def _apply_patches(workspace: Path, results: list[dict]) -> tuple[list[dict], list[dict]]:
     seen = set()
+    accepted = []
+    rejected = []
     for result in results:
-        generated = result.get("patch") or {}
-        patch = generated.get("patch", "")
-        if not patch:
-            continue
-        paths = {path.casefold() for path in generated["test_files"]}
-        if seen & paths:
-            raise ValueError(f"Generated test patches overlap: {', '.join(sorted(seen & paths))}")
-        seen.update(paths)
-        applied = subprocess.run(["git", "apply", "-"], cwd=workspace, input=patch.encode("utf-8"),
-                                 capture_output=True, timeout=30)
-        if applied.returncode:
-            raise ValueError(f"Cannot apply generated patch: {applied.stderr.decode(errors='replace').strip()[:1000]}")
+        try:
+            generated = result.get("patch") or {}
+            patch = generated.get("patch", "")
+            if patch:
+                paths = {path.casefold() for path in generated["test_files"]}
+                if seen & paths:
+                    raise ValueError(f"Generated test patches overlap: {', '.join(sorted(seen & paths))}")
+                applied = subprocess.run(["git", "apply", "-"], cwd=workspace, input=patch.encode("utf-8"),
+                                         capture_output=True, timeout=30)
+                if applied.returncode:
+                    raise ValueError(f"Cannot apply generated patch: {applied.stderr.decode(errors='replace').strip()[:1000]}")
+                seen.update(paths)
+            accepted.append(result)
+        except Exception as exc:
+            rejected.append({"agent": result["agent"], "error": str(exc)})
+    return accepted, rejected
 
 
 def _uses_vitest(command: str, workspace: Path, depth: int = 0,
@@ -132,14 +139,14 @@ def _suite_commands(results: list[dict], workspace: Path) -> list[tuple[str, str
             seen.add(command)
             name = f"{result['agent']}-{index + 1}"
             if result["agent"] == "playwright":
-                if "playwright" not in command:
+                if not re.search(r"\bplaywright\s+test\b", command):
                     raise ValueError("Playwright agent command does not invoke Playwright")
                 command = (
                     f"PLAYWRIGHT_JSON_OUTPUT_FILE=/workspace/.ardberg-results/{name}.json "
                     + command + f" --trace on --reporter=json --output=/workspace/test-results/{name}"
                 )
             elif result["agent"] == "vitest" or _uses_vitest(command, workspace):
-                if result["agent"] == "vitest" and "vitest" not in command:
+                if result["agent"] == "vitest" and not _uses_vitest(command, workspace):
                     raise ValueError("Vitest agent command does not invoke Vitest")
                 forwarding = " --" if re.match(r"^(?:corepack\s+)?npm\s+(?:run\s+)?", command) else ""
                 command += f"{forwarding} --reporter=json --outputFile=/workspace/.ardberg-results/{name}.json"
@@ -202,15 +209,18 @@ def _environment_args(values: dict[str, str]) -> list[str]:
 
 
 async def _start_postgres(run_id: str, network: str, name: str,
-                          password: str) -> None:
+                          password: str, stage: str = "execution",
+                          agent: str = "executor", image: str | None = None,
+                          network_alias: str = "postgres",
+                          node: str = "postgres_ready") -> None:
     code, output = await _command(
         "docker", "run", "-d", "--name", name, "--network", network,
-        "--network-alias", "postgres", "--memory", "1g", "--cpus", "1",
+        "--network-alias", network_alias, "--memory", "1g", "--cpus", "1",
         "--pids-limit", "128", "--cap-drop", "ALL",
         "--security-opt", "no-new-privileges", "--user", "postgres",
         "-e", "POSTGRES_USER=ardberg", "-e", "POSTGRES_DB=ardberg_test",
         "-e", f"POSTGRES_PASSWORD={password}",
-        settings.postgres_test_image, timeout=60,
+        image or settings.postgres_test_image, timeout=60,
     )
     if code:
         raise RuntimeError(f"Could not start isolated PostgreSQL: {output}")
@@ -220,13 +230,37 @@ async def _start_postgres(run_id: str, network: str, name: str,
             "-d", "ardberg_test", timeout=5,
         )
         if code == 0:
-            emit(run_id, "execution", "passed", agent="executor",
-                 node="postgres_ready", success=True)
+            emit(run_id, stage, "passed", agent=agent,
+                 node=node, success=True)
             return
         await asyncio.sleep(1)
     _, logs = await _command("docker", "logs", name, timeout=10)
-    path = write_artifact(run_id, "logs/postgres-startup.log", logs)
+    path = write_artifact(run_id, f"logs/{stage}-postgres-startup.log", logs)
     raise RuntimeError(f"Isolated PostgreSQL did not become ready; see {path}")
+
+
+def _postgres_image(source: Path, service: dict) -> str:
+    extensions = {str(item).lower() for item in service.get("required_extensions", [])}
+    if not extensions:
+        scanned = 0
+        root = source.resolve()
+        for path in root.rglob("*"):
+            if scanned >= 5_000_000:
+                break
+            if (not path.is_file() or path.is_symlink() or
+                    path.suffix.lower() not in {".sql", ".ts", ".js", ".py"} or
+                    not any(part in {"db", "database", "drizzle", "migrations", "schema", "scripts"}
+                            for part in path.relative_to(root).parts[:-1])):
+                continue
+            size = path.stat().st_size
+            if size > 100_000 or scanned + size > 5_000_000:
+                continue
+            scanned += size
+            if re.search(r"\bCREATE\s+EXTENSION(?:\s+IF\s+NOT\s+EXISTS)?\s+\"?vector\"?\b",
+                         path.read_text(encoding="utf-8", errors="ignore"), re.IGNORECASE):
+                extensions.add("vector")
+                break
+    return settings.postgres_vector_image if "vector" in extensions else settings.postgres_test_image
 
 
 async def _copy_runner_outputs(container: str, output_root: Path) -> None:
@@ -237,6 +271,300 @@ async def _copy_runner_outputs(container: str, output_root: Path) -> None:
             "docker", "cp", f"{container}:/workspace/{directory}/.",
             str(destination), timeout=120,
         )
+
+
+async def _baseline_browser_review(run_id: str, context: dict, output_root: Path,
+                                   review_dir: Path) -> dict:
+    base_path = context.get("base_source_path")
+    base_source = Path(base_path) if base_path else None
+    if base_source is None or not base_source.is_dir() or context["analysis"].get("services"):
+        reason = ("Pinned base source is unavailable" if base_source is None or not base_source.is_dir() else
+                  "Baseline browser setup needs a separate disposable service fixture")
+        emit(run_id, "execution", "not_selected", agent="executor", node="baseline_visual",
+             detail={"reason": reason})
+        return {"status": "not_run", "attempted": False, "reason": reason}
+    root = run_dir(run_id).resolve()
+    workspace = (root / "baseline-workspace").resolve()
+    if root not in workspace.parents:
+        raise ValueError("Baseline path must stay inside the run directory")
+    if workspace.exists():
+        shutil.rmtree(workspace)
+    shutil.copytree(base_source, workspace)
+    shutil.copytree(review_dir, workspace / ".ardberg-review")
+    container = f"ardberg-base-{run_id[:8]}-{uuid4().hex[:6]}"
+    network = f"{container}-private"
+    analysis = context["analysis"]
+    start_command = (analysis.get("playwright", {}).get("setup_command") or
+                     analysis.get("app_start_command") or "").strip()
+    ready_url = (analysis.get("playwright", {}).get("ready_url") or
+                 analysis.get("app_ready_url") or "").strip()
+    emit(run_id, "execution", "running", agent="executor", node="baseline_visual")
+    try:
+        code, output = await _command(
+            "docker", "run", "-d", "--name", container, "--network", "bridge",
+            "--workdir", "/workspace", "--memory", settings.runner_memory,
+            "--cpus", settings.runner_cpus, "--pids-limit", str(settings.runner_pids_limit),
+            "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+            settings.docker_image, "sleep", "infinity", timeout=60,
+        )
+        if code:
+            raise RuntimeError(f"Could not start baseline runner: {output}")
+        code, output = await _command("docker", "cp", str(workspace) + os.sep + ".",
+                                      f"{container}:/workspace", timeout=180)
+        if code:
+            raise RuntimeError(f"Could not copy baseline source: {output}")
+        for index, command in enumerate(analysis.get("install_commands", [])):
+            code, output = await _command(
+                "docker", "exec", "-e", f"NPM_CONFIG_REGISTRY={settings.npm_registry_url}",
+                "-e", f"PIP_INDEX_URL={settings.pip_index_url}", container,
+                "sh", "-lc", command, timeout=settings.test_timeout_seconds,
+            )
+            path = write_artifact(run_id, f"logs/baseline-install-{index + 1}.log", output)
+            if code:
+                raise RuntimeError(f"Baseline install failed; see {path}")
+        code, _ = await _command("docker", "exec", container, "node", "-e",
+                                 "require.resolve('@playwright/test')", timeout=20)
+        if code:
+            code, output = await _command(
+                "docker", "exec", "-e", f"NPM_CONFIG_REGISTRY={settings.npm_registry_url}",
+                container, "sh", "-lc", "npm install --no-save @playwright/test@1.63.0",
+                timeout=settings.test_timeout_seconds,
+            )
+            if code:
+                path = write_artifact(run_id, "logs/baseline-browser-dependency.log", output)
+                raise RuntimeError(f"Baseline browser dependency failed; see {path}")
+        code, output = await _command("docker", "network", "create", "--internal", network, timeout=30)
+        if code:
+            raise RuntimeError(f"Could not create baseline network: {output}")
+        code, output = await _command("docker", "network", "connect", network, container, timeout=30)
+        if code:
+            raise RuntimeError(f"Could not attach baseline network: {output}")
+        code, output = await _command("docker", "network", "disconnect", "bridge", container, timeout=30)
+        if code:
+            raise RuntimeError(f"Could not isolate baseline network: {output}")
+        code, output = await _command(
+            "docker", "exec", "-d", *_environment_args(_test_environment(analysis)),
+            container, "sh", "-lc", f"exec {start_command} > /tmp/ardberg-app.log 2>&1",
+            timeout=30,
+        )
+        if code:
+            raise RuntimeError(f"Baseline application startup failed: {output}")
+        ready = "for i in $(seq 1 40); do curl -fsS " + shlex.quote(ready_url) + " >/dev/null && exit 0; sleep 1; done; exit 1"
+        code, output = await _command("docker", "exec", container, "sh", "-lc", ready, timeout=50)
+        if code:
+            raise RuntimeError(f"Baseline application did not become ready: {output}")
+        await _command("docker", "exec", container, "mkdir", "-p", "/workspace/.ardberg-results", timeout=20)
+        code, output = await _command("docker", "exec", container, "node",
+                                      "/workspace/.ardberg-review/browser_audit.cjs",
+                                      timeout=settings.test_timeout_seconds)
+        destination = output_root / ".ardberg-results" / "baseline"
+        destination.mkdir(parents=True, exist_ok=True)
+        copied, copy_output = await _command(
+            "docker", "cp", f"{container}:/workspace/.ardberg-results/.",
+            str(destination), timeout=120,
+        )
+        if copied or not (destination / "visual-details.json").is_file():
+            raise RuntimeError(f"Baseline browser evidence could not be collected: {copy_output or output}")
+        emit(run_id, "execution", "passed", agent="executor", node="baseline_visual",
+             success=True, detail={"browser_exit_code": code,
+                                   "path": "evidence/.ardberg-results/baseline/visual-details.json"})
+        return {"status": "captured", "attempted": True, "browser_exit_code": code}
+    except Exception as exc:
+        emit(run_id, "execution", "failed", agent="executor", node="baseline_visual",
+             success=False, detail={"error": str(exc)})
+        return {"status": "not_run", "attempted": True, "reason": str(exc)}
+    finally:
+        for args in (("docker", "rm", "-f", container),
+                     ("docker", "network", "rm", network)):
+            try:
+                await _command(*args, timeout=15)
+            except Exception:
+                pass
+
+
+def _compare_visual_artifacts(run_id: str, output_root: Path) -> str | None:
+    root = output_root / ".ardberg-results"
+    base = root / "baseline" / "visual"
+    head = root / "visual"
+    if not base.is_dir() or not head.is_dir():
+        return None
+    comparisons = []
+    for original in sorted(base.glob("*.png")):
+        current = head / original.name
+        if not current.is_file():
+            continue
+        comparisons.append({"name": original.name,
+                            "same_bytes": hashlib.sha256(original.read_bytes()).digest()
+                            == hashlib.sha256(current.read_bytes()).digest(),
+                            "base_artifact": "evidence/.ardberg-results/baseline/visual/" + original.name,
+                            "head_artifact": "evidence/.ardberg-results/visual/" + original.name})
+    if not comparisons:
+        return None
+    return write_artifact(run_id, "evidence/visual-comparison.json",
+                          json.dumps({"comparison": "Exact screenshot bytes only; differences require review",
+                                      "screenshots": comparisons}, indent=2))
+
+
+async def _database_row_counts(container: str, password: str) -> dict[str, int]:
+    prefix = ("docker", "exec", "-e", f"PGPASSWORD={password}", container,
+              "psql", "-h", "127.0.0.1", "-U", "ardberg", "-d", "ardberg_test",
+              "-t", "-A", "-c")
+    query = ("SELECT coalesce(json_agg(json_build_array(schemaname, tablename)), '[]'::json) "
+             "FROM pg_tables WHERE schemaname NOT IN ('pg_catalog', 'information_schema')")
+    code, output = await _command(*prefix, query, timeout=30)
+    if code:
+        raise RuntimeError(f"Could not list disposable database tables: {output}")
+    tables = json.loads(output.strip())
+    if len(tables) > 500:
+        raise ValueError("Disposable database has more than 500 tables")
+    counts = {}
+    for schema, table in tables:
+        escaped_schema = schema.replace('"', '""')
+        escaped_table = table.replace('"', '""')
+        code, output = await _command(
+            *prefix, f'SELECT count(*) FROM "{escaped_schema}"."{escaped_table}"', timeout=15,
+        )
+        if code:
+            raise RuntimeError(f"Could not count rows in {schema}.{table}: {output}")
+        counts[f"{schema}.{table}"] = int(output.strip())
+    return counts
+
+
+async def _database_fingerprints(container: str, password: str,
+                                 original_columns: dict[str, list[str]] | None = None) -> tuple[dict[str, list[str]], dict[str, str | None]]:
+    counts = await _database_row_counts(container, password)
+    prefix = ("docker", "exec", "-e", f"PGPASSWORD={password}", container,
+              "psql", "-h", "127.0.0.1", "-U", "ardberg", "-d", "ardberg_test",
+              "-t", "-A", "-c")
+    columns_by_table = {}
+    fingerprints = {}
+    for full_name in counts:
+        schema, table = full_name.split(".", 1)
+        schema_literal = schema.replace("'", "''")
+        table_literal = table.replace("'", "''")
+        query = ("SELECT coalesce(json_agg(column_name ORDER BY ordinal_position), '[]'::json) "
+                 "FROM information_schema.columns WHERE table_schema = '" + schema_literal +
+                 "' AND table_name = '" + table_literal + "'")
+        code, output = await _command(*prefix, query, timeout=15)
+        if code:
+            raise RuntimeError(f"Could not inspect columns of {full_name}: {output}")
+        available = json.loads(output.strip())
+        columns = original_columns.get(full_name, available) if original_columns else available
+        columns_by_table[full_name] = columns
+        if not columns or any(column not in available for column in columns):
+            fingerprints[full_name] = None
+            continue
+        quoted = lambda value: '"' + value.replace('"', '""') + '"'
+        selected = ", ".join(quoted(column) for column in columns)
+        table_name = f"{quoted(schema)}.{quoted(table)}"
+        digest_query = (
+            "SELECT md5(coalesce(string_agg(md5(row_to_json(t)::text), ',' "
+            "ORDER BY md5(row_to_json(t)::text)), '')) FROM "
+            f"(SELECT {selected} FROM {table_name}) t"
+        )
+        code, output = await _command(*prefix, digest_query, timeout=60)
+        if code:
+            raise RuntimeError(f"Could not fingerprint seeded records in {full_name}: {output}")
+        fingerprints[full_name] = output.strip()
+    if original_columns:
+        for full_name in original_columns.keys() - columns_by_table.keys():
+            columns_by_table[full_name] = original_columns[full_name]
+            fingerprints[full_name] = None
+    return columns_by_table, fingerprints
+
+
+async def _seeded_database_review(run_id: str, context: dict, container: str,
+                                  network: str, prepared_error: str = "") -> dict:
+    analysis = context["analysis"]
+    services = analysis.get("services") or []
+    service = services[0] if len(services) == 1 and services[0]["kind"] == "postgres" else {}
+    if not all(service.get(key) for key in
+               ("baseline_setup_commands", "seed_commands", "upgrade_commands")):
+        reason = "No evidenced baseline setup, seed fixture, and upgrade command set"
+        emit(run_id, "execution", "not_selected", agent="executor", node="database_upgrade",
+             detail={"reason": reason})
+        return {"status": "not_run", "reason": reason}
+    if prepared_error:
+        emit(run_id, "execution", "failed", agent="executor", node="database_upgrade",
+             success=False, detail={"error": prepared_error})
+        return {"status": "failed", "error": prepared_error}
+    upgrade_database = f"{container}-upgrade-postgres"
+    password = secrets.token_urlsafe(24)
+    emit(run_id, "execution", "running", agent="executor", node="database_upgrade")
+    emit(run_id, "execution", "running", agent="executor", node="upgrade_postgres_ready")
+    try:
+        source = Path(context["source_path"])
+        try:
+            await _start_postgres(run_id, network, upgrade_database, password,
+                                  image=_postgres_image(source, service),
+                                  network_alias="postgres-upgrade", node="upgrade_postgres_ready")
+        except Exception as exc:
+            emit(run_id, "execution", "failed", agent="executor",
+                 node="upgrade_postgres_ready", success=False, detail={"error": str(exc)})
+            raise
+        environment = _test_environment(analysis, password)
+        environment = {key: value.replace("@postgres:5432/", "@postgres-upgrade:5432/")
+                       for key, value in environment.items()}
+        for phase, commands, cwd in (
+            ("baseline", service["baseline_setup_commands"], "/baseline"),
+            ("seed", service["seed_commands"], "/baseline"),
+            ("upgrade", service["upgrade_commands"], "/workspace"),
+        ):
+            if phase == "upgrade":
+                before = await _database_row_counts(upgrade_database, password)
+                original_columns, before_fingerprints = await _database_fingerprints(
+                    upgrade_database, password,
+                )
+            for index, command in enumerate(commands):
+                code, output = await _command(
+                    "docker", "exec", "-w", cwd, *_environment_args(environment),
+                    container, "sh", "-lc", command,
+                    timeout=settings.test_timeout_seconds,
+                )
+                path = write_artifact(run_id, f"logs/database-{phase}-{index + 1}.log", output)
+                if code:
+                    raise RuntimeError(f"Disposable {phase} command failed (exit {code}); see {path}")
+        after = await _database_row_counts(upgrade_database, password)
+        _, after_fingerprints = await _database_fingerprints(
+            upgrade_database, password, original_columns,
+        )
+        decreased = {table: {"before": count, "after": after.get(table)}
+                     for table, count in before.items() if after.get(table, -1) < count}
+        changed_records = {table: {"before": digest, "after": after_fingerprints.get(table)}
+                           for table, digest in before_fingerprints.items()
+                           if after_fingerprints.get(table) != digest}
+        schema_code, schema_output = await _command(
+            "docker", "exec", "-e", f"PGPASSWORD={password}", upgrade_database,
+            "pg_dump", "-h", "127.0.0.1", "-U", "ardberg", "--schema-only",
+            "--no-owner", "ardberg_test", timeout=90,
+        )
+        if schema_code:
+            raise RuntimeError(f"Could not inspect upgraded database schema: {schema_output}")
+        schema_path = write_artifact(run_id, "evidence/database/upgraded-schema.sql", schema_output)
+        needs_review = bool(decreased or changed_records)
+        result = {"status": "needs_review" if needs_review else "passed",
+                  "rows_before": before, "rows_after": after,
+                  "decreased_or_removed_tables": decreased,
+                  "changed_seeded_records": changed_records,
+                  "schema_artifact": schema_path,
+                  "note": "Changed data fingerprints need human review; intentional migrations may transform records"}
+        path = write_artifact(run_id, "evidence/database/upgrade-review.json",
+                              json.dumps(result, indent=2))
+        emit(run_id, "execution", "failed" if needs_review else "passed", agent="executor",
+             node="database_upgrade", success=not needs_review,
+             detail={"path": path, "decreased_or_removed_tables": decreased,
+                     "changed_seeded_records": changed_records,
+                     "schema_artifact": schema_path})
+        return result
+    except Exception as exc:
+        emit(run_id, "execution", "failed", agent="executor", node="database_upgrade",
+             success=False, detail={"error": str(exc)})
+        return {"status": "failed", "error": str(exc)}
+    finally:
+        try:
+            await _command("docker", "rm", "-f", upgrade_database, timeout=15)
+        except Exception:
+            pass
 
 
 async def execute_tests(run_id: str, context: dict, results: list[dict]) -> dict:
@@ -253,18 +581,71 @@ async def execute_tests(run_id: str, context: dict, results: list[dict]) -> dict
     shutil.copytree(source, workspace)
     output_root.mkdir()
     emit(run_id, "execution", "running", agent="executor", node="apply_patches")
-    try:
-        _apply_patches(workspace, results)
-    except Exception as exc:
-        emit(run_id, "execution", "failed", agent="executor", node="apply_patches",
-             success=False, detail={"error": str(exc)})
-        return {"success": False, "error": str(exc), "suites": []}
-    emit(run_id, "execution", "passed", agent="executor", node="apply_patches", success=True)
+    accepted, rejected = _apply_patches(workspace, results)
+    emit(run_id, "execution", "failed" if rejected else "passed", agent="executor",
+         node="apply_patches", success=not rejected,
+         detail={"rejected": rejected,
+                 "error": "; ".join(item["error"] for item in rejected) if rejected else ""})
+    if not accepted:
+        return {"success": False, "error": "No valid test patches remain", "suites": [],
+                "rejected_patches": rejected}
+    suites = []
+    rejected_commands = []
+    runnable = []
+    for result in accepted:
+        try:
+            selected = _suite_commands([result], workspace)
+            if not selected:
+                raise ValueError("Agent produced no executable test commands")
+        except ValueError as exc:
+            rejected_commands.append({"agent": result["agent"], "error": str(exc)})
+            emit(run_id, "execution", "failed", agent="executor",
+                 node=f"{result['agent']}-commands", success=False,
+                 detail={"error": str(exc)})
+            patch = (result.get("patch") or {}).get("patch", "")
+            if patch:
+                reversed_patch = subprocess.run(
+                    ["git", "apply", "-R", "-"], cwd=workspace,
+                    input=patch.encode("utf-8"), capture_output=True, timeout=30,
+                )
+                if reversed_patch.returncode:
+                    return {"success": False, "error": "Could not remove rejected agent patch",
+                            "suites": [], "rejected_patches": rejected,
+                            "rejected_commands": rejected_commands}
+            continue
+        suites.extend(selected)
+        runnable.append(result)
+    accepted = runnable
+    if not suites:
+        return {"success": False, "error": "No executable test commands remain",
+                "suites": [], "rejected_patches": rejected,
+                "rejected_commands": rejected_commands}
+
+    analysis = context["analysis"]
+    browser_audit = any(item["agent"] == "playwright" for item in accepted) and (
+        analysis.get("playwright", {}).get("target") == "browser"
+    )
+    if browser_audit:
+        review_dir = workspace / ".ardberg-review"
+        review_dir.mkdir(exist_ok=True)
+        shutil.copyfile(Path(__file__).parent / "resources" / "browser_audit.cjs",
+                        review_dir / "browser_audit.cjs")
+        routes = [item["path"] for item in
+                  context.get("impact_map", {}).get("browser_targets", [])][:4] or ["/"]
+        ready_url = (analysis.get("playwright", {}).get("ready_url") or
+                     analysis.get("app_ready_url") or "").strip()
+        (review_dir / "targets.json").write_text(json.dumps({
+            "baseUrl": ready_url, "paths": list(dict.fromkeys(routes)),
+            "widths": [390, 768, 1440],
+        }), encoding="utf-8")
+        suites.append(("visual-review", "node /workspace/.ardberg-review/browser_audit.cjs"))
 
     container = f"ardberg-{run_id[:8]}-{uuid4().hex[:6]}"
     network = f"{container}-private"
     database_container = f"{container}-postgres"
     database_started = False
+    security_scans = []
+    upgrade_prepared_error = ""
     emit(run_id, "execution", "running", agent="executor", node="start_runner")
     try:
         code, output = await _command(
@@ -285,11 +666,10 @@ async def execute_tests(run_id: str, context: dict, results: list[dict]) -> dict
             raise RuntimeError(f"Could not copy the pinned checkout into the runner: {output}")
         emit(run_id, "execution", "passed", agent="executor", node="start_runner", success=True,
              detail={"container": container})
-        analysis = context["analysis"]
         emit(run_id, "execution", "running", agent="executor", node="setup")
         install_commands = list(analysis["install_commands"])
         if not analysis["has_native_test_framework"]:
-            selected = set(context["selected_frameworks"])
+            selected = {item["agent"] for item in accepted}
             packages = []
             if "playwright" in selected:
                 packages.append("@playwright/test@1.63.0")
@@ -311,6 +691,74 @@ async def execute_tests(run_id: str, context: dict, results: list[dict]) -> dict
                  detail={"path": path, "command": command})
             if code:
                 raise RuntimeError(f"Install command failed (exit {code}); see {path}")
+        services = analysis.get("services") or []
+        service = services[0] if len(services) == 1 and services[0]["kind"] == "postgres" else {}
+        if all(service.get(key) for key in
+               ("baseline_setup_commands", "seed_commands", "upgrade_commands")):
+            base_path = context.get("base_source_path")
+            if not base_path or not Path(base_path).is_dir():
+                upgrade_prepared_error = "Pinned base source is unavailable for migration review"
+            else:
+                code, output = await _command("docker", "exec", container,
+                                              "mkdir", "-p", "/baseline", timeout=20)
+                if not code:
+                    code, output = await _command(
+                        "docker", "cp", str(Path(base_path)) + os.sep + ".",
+                        f"{container}:/baseline", timeout=180,
+                    )
+                if code:
+                    upgrade_prepared_error = f"Could not prepare baseline source: {output}"
+                else:
+                    for index, command in enumerate(analysis.get("install_commands", [])):
+                        code, output = await _command(
+                            "docker", "exec", "-w", "/baseline",
+                            "-e", f"NPM_CONFIG_REGISTRY={settings.npm_registry_url}",
+                            "-e", f"PIP_INDEX_URL={settings.pip_index_url}",
+                            container, "sh", "-lc", command,
+                            timeout=settings.test_timeout_seconds,
+                        )
+                        path = write_artifact(run_id, f"logs/database-baseline-install-{index + 1}.log", output)
+                        if code:
+                            upgrade_prepared_error = f"Baseline dependency install failed; see {path}"
+                            break
+        for index, command in enumerate(analysis.get("security_check_commands", [])):
+            name = f"scan-{index + 1}"
+            emit(run_id, "security", "running", agent="executor", node=name,
+                 detail={"command": command})
+            try:
+                code, output = await _command(
+                    "docker", "exec", "-e", f"NPM_CONFIG_REGISTRY={settings.npm_registry_url}",
+                    "-e", f"PIP_INDEX_URL={settings.pip_index_url}", container,
+                    "sh", "-lc", command, timeout=settings.test_timeout_seconds,
+                )
+                path = write_artifact(run_id, f"logs/security-{name}.log", output)
+                result = {"name": name, "command": command, "success": code == 0,
+                          "exit_code": code, "log": path}
+            except Exception as exc:
+                result = {"name": name, "command": command, "success": False,
+                          "error": str(exc)}
+            security_scans.append(result)
+            emit(run_id, "security", "passed" if result["success"] else "failed",
+                 agent="executor", node=name, success=result["success"], detail=result)
+        if not analysis.get("security_check_commands"):
+            emit(run_id, "security", "not_selected", agent="executor", node="scans",
+                 detail={"reason": "No repository-declared security scanner command was verified"})
+        if browser_audit:
+            code, _ = await _command(
+                "docker", "exec", container, "node", "-e",
+                "require.resolve('@playwright/test')", timeout=20,
+            )
+            if code:
+                code, output = await _command(
+                    "docker", "exec", "-e", f"NPM_CONFIG_REGISTRY={settings.npm_registry_url}",
+                    container, "sh", "-lc", "npm install --no-save @playwright/test@1.63.0",
+                    timeout=settings.test_timeout_seconds,
+                )
+                path = write_artifact(run_id, "logs/visual-dependency.log", output)
+                emit(run_id, "execution", "artifact", agent="executor", node="setup",
+                     detail={"path": path})
+                if code:
+                    raise RuntimeError(f"Could not install browser audit dependency; see {path}")
         code, output = await _command("docker", "network", "create", "--internal", network, timeout=30)
         if code:
             raise RuntimeError(f"Could not create private test network: {output}")
@@ -327,7 +775,8 @@ async def execute_tests(run_id: str, context: dict, results: list[dict]) -> dict
             postgres_password = secrets.token_urlsafe(24)
             database_started = True
             emit(run_id, "execution", "running", agent="executor", node="postgres_ready")
-            await _start_postgres(run_id, network, database_container, postgres_password)
+            await _start_postgres(run_id, network, database_container, postgres_password,
+                                  image=_postgres_image(source, analysis["services"][0]))
         runtime_environment = _test_environment(analysis, postgres_password)
         for index, command in enumerate(
             command for service in analysis.get("services", [])
@@ -342,13 +791,29 @@ async def execute_tests(run_id: str, context: dict, results: list[dict]) -> dict
                  detail={"path": path, "command": command})
             if code:
                 raise RuntimeError(f"Test service setup command failed (exit {code}); see {path}")
+        database_snapshot_failed = False
+        if database_started:
+            emit(run_id, "execution", "running", agent="executor", node="database_snapshot")
+            code, schema_output = await _command(
+                "docker", "exec", "-e", f"PGPASSWORD={postgres_password}",
+                database_container, "pg_dump", "-h", "127.0.0.1", "-U", "ardberg",
+                "--schema-only", "--no-owner", "ardberg_test", timeout=90,
+            )
+            if code:
+                database_snapshot_failed = True
+                emit(run_id, "execution", "failed", agent="executor", node="database_snapshot",
+                     success=False, detail={"error": schema_output[-1000:]})
+            else:
+                schema_path = write_artifact(run_id, "evidence/database/head-schema.sql", schema_output)
+                emit(run_id, "execution", "passed", agent="executor", node="database_snapshot",
+                     success=True, detail={"path": schema_path})
         code, output = await _command(
             "docker", "exec", container, "mkdir", "-p", "/workspace/.ardberg-results", timeout=20,
         )
         if code:
             raise RuntimeError(f"Could not create report directory: {output}")
         playwright_enabled = any(
-            result["agent"] == "playwright" for result in results
+            result["agent"] == "playwright" for result in accepted
         )
         playwright_decision = analysis.get("playwright", {}) if playwright_enabled else {}
         start_command = (
@@ -371,10 +836,6 @@ async def execute_tests(run_id: str, context: dict, results: list[dict]) -> dict
                 if code:
                     raise RuntimeError(f"Application did not become ready at {ready_url}: {output}")
         emit(run_id, "execution", "passed", agent="executor", node="setup", success=True)
-
-        suites = _suite_commands(results, workspace)
-        if not suites:
-            raise RuntimeError("No executable test commands were produced")
 
         async def run_suite(name: str, command: str) -> dict:
             emit(run_id, "execution", "running", agent="executor", node=name,
@@ -402,7 +863,7 @@ async def execute_tests(run_id: str, context: dict, results: list[dict]) -> dict
                         "structured_result": structured}
             except asyncio.CancelledError:
                 emit(run_id, "execution", "cancelled", agent="executor", node=name,
-                     detail={"reason": "Global fail-fast"})
+                     detail={"reason": "Run cancelled externally"})
                 raise
             except Exception as exc:
                 emit(run_id, "execution", "failed", agent="executor", node=name,
@@ -410,33 +871,42 @@ async def execute_tests(run_id: str, context: dict, results: list[dict]) -> dict
                 return {"name": name, "success": False, "error": str(exc)}
 
         tasks = [asyncio.create_task(run_suite(name, command)) for name, command in suites]
-        findings = []
-        pending = set(tasks)
-        while pending:
-            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-            for item in done:
-                result = item.result()
-                findings.append(result)
-                if not result["success"]:
-                    for sibling in pending:
-                        sibling.cancel()
-                    await _command("docker", "stop", "-t", "2", container, timeout=15)
-                    await asyncio.gather(*pending, return_exceptions=True)
-                    emit(run_id, "execution", "running", agent="executor", node="collect")
-                    await _copy_runner_outputs(container, output_root)
-                    artifacts = _collect_output_artifacts(run_id, output_root)
-                    emit(run_id, "execution", "artifact", agent="executor", node="collect",
-                         detail={"paths": artifacts})
-                    emit(run_id, "execution", "passed", agent="executor", node="collect",
-                         success=True, detail={"paths": artifacts})
-                    return {"success": False, "error": f"Suite {result['name']} failed",
-                            "suites": findings, "artifacts": artifacts}
+        findings = await asyncio.gather(*tasks)
+        database_upgrade = {"status": "not_applicable"}
+        if database_started:
+            database_upgrade = await _seeded_database_review(
+                run_id, context, container, network, upgrade_prepared_error,
+            )
+        baseline = {"status": "not_applicable"}
+        if browser_audit:
+            baseline = await _baseline_browser_review(run_id, context, output_root, review_dir)
         emit(run_id, "execution", "running", agent="executor", node="collect")
         await _copy_runner_outputs(container, output_root)
+        comparison_path = _compare_visual_artifacts(run_id, output_root) if browser_audit else None
+        if comparison_path:
+            emit(run_id, "execution", "passed", agent="executor", node="compare_visual",
+                 success=True, detail={"path": comparison_path})
         artifacts = _collect_output_artifacts(run_id, output_root)
         emit(run_id, "execution", "passed", agent="executor", node="collect", success=True,
              detail={"suites": findings, "artifacts": artifacts})
-        return {"success": True, "suites": findings, "artifacts": artifacts}
+        failed_suites = [item["name"] for item in findings if not item["success"]]
+        problems = [f"Suite {name} failed" for name in failed_suites]
+        problems.extend(f"{item['agent']} patch: {item['error']}" for item in rejected)
+        problems.extend(f"{item['agent']} command: {item['error']}" for item in rejected_commands)
+        if database_snapshot_failed:
+            problems.append("Disposable database schema snapshot failed")
+        problems.extend(f"Security scan {item['name']} failed" for item in security_scans
+                        if not item["success"])
+        if baseline.get("attempted") and baseline["status"] != "captured":
+            problems.append("Baseline browser review failed")
+        if database_upgrade["status"] in {"failed", "needs_review"}:
+            problems.append("Seeded database upgrade failed or needs review")
+        return {"success": not problems, "error": "; ".join(problems),
+                "suites": findings, "artifacts": artifacts, "baseline": baseline,
+                "database_upgrade": database_upgrade,
+                "security_scans": security_scans,
+                "visual_comparison": comparison_path, "rejected_patches": rejected,
+                "rejected_commands": rejected_commands}
     except Exception as exc:
         emit(run_id, "execution", "failed", agent="executor", node="setup", success=False,
              detail={"error": str(exc)})

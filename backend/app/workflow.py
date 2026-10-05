@@ -1,4 +1,5 @@
 import asyncio
+import json
 from datetime import timedelta
 
 from temporalio import activity, workflow
@@ -6,7 +7,8 @@ from temporalio.common import RetryPolicy
 from temporalio.contrib.langgraph import graph
 
 with workflow.unsafe.imports_passed_through():
-    from .events import cancel_running_nodes, emit, get_events, set_run
+    from .artifacts import artifact_path, write_artifact
+    from .events import emit, get_events, set_run
     from .inspection import prepare_run
     from .publication import publish_generated_tests
     from .report import generate_report, publish_report
@@ -14,6 +16,11 @@ with workflow.unsafe.imports_passed_through():
 
 
 NO_RETRY = RetryPolicy(maximum_attempts=1)
+
+
+def inferred_feature_unverified(context: dict, results: list[dict]) -> bool:
+    return (context.get("instruction_source") == "inferred" and
+            not any((result.get("plan") or {}).get("cases") for result in results))
 
 
 @activity.defn
@@ -45,6 +52,8 @@ async def commit_tests_activity(run_id: str, context: dict,
 @activity.defn
 async def report_activity(run_id: str, outcome: dict) -> str:
     set_run(run_id, stage="report")
+    if not artifact_path(run_id, "outcome.json").is_file():
+        write_artifact(run_id, "outcome.json", json.dumps(outcome, indent=2))
     try:
         return await generate_report(run_id, outcome)
     except Exception as exc:
@@ -69,8 +78,6 @@ async def publish_activity(run_id: str, markdown: str, success: bool) -> None:
 
 @activity.defn
 async def status_activity(run_id: str, status: str, stage: str, error: str = "") -> None:
-    if status == "reporting" and error:
-        cancel_running_nodes(run_id)
     set_run(run_id, status=status, stage=stage, error=error or None)
     emit(run_id, stage, status, detail={"error": error} if error else {})
 
@@ -119,23 +126,31 @@ class RunWorkflow:
                         result = task.result()
                     except Exception as exc:
                         result = {"agent": agent, "failed": True, "error": str(exc)}
-                    if result.get("failed"):
-                        for remaining in pending:
-                            remaining.cancel()
-                        await asyncio.gather(*pending, return_exceptions=True)
-                        outcome = {"success": False, "stage": "agents",
-                                   "error": result.get("error", f"{agent} failed"),
-                                   "agents": agent_results + [result]}
-                        raise RuntimeError(outcome["error"])
                     agent_results.append(result)
-            execution = await workflow.execute_activity(
-                execute_activity, args=[run_id, context, agent_results],
-                start_to_close_timeout=timedelta(hours=2), retry_policy=NO_RETRY,
-            )
-            outcome = {"success": execution["success"], "stage": "execution",
+            agent_results.sort(key=lambda result: context["enabled_agents"].index(result["agent"]))
+            failed_agents = [result for result in agent_results if result.get("failed")]
+            usable_results = [result for result in agent_results
+                              if not result.get("failed") and not result.get("skipped")]
+            if usable_results:
+                execution = await workflow.execute_activity(
+                    execute_activity, args=[run_id, context, usable_results],
+                    start_to_close_timeout=timedelta(hours=2), retry_policy=NO_RETRY,
+                )
+            else:
+                execution = {"success": False, "error": "No agent produced executable tests", "suites": []}
+            problems = [f"{item['agent']}: {item.get('error') or 'agent failed'}" for item in failed_agents]
+            if execution.get("error"):
+                problems.append(execution["error"])
+            feature_unverified = inferred_feature_unverified(context, usable_results)
+            if feature_unverified:
+                problems.append("No executable feature-specific test case was planned; "
+                                "existing suite results do not verify the PR feature")
+            outcome = {"success": execution["success"] and not failed_agents
+                       and not context.get("review_incomplete") and not feature_unverified,
+                       "stage": "execution" if usable_results else "agents",
                        "execution": execution, "agents": agent_results,
-                       "error": execution.get("error", "")}
-            if execution["success"]:
+                       "error": "; ".join(problems + context.get("review_incomplete_reasons", []))}
+            if outcome["success"]:
                 publication = await workflow.execute_activity(
                     commit_tests_activity, args=[run_id, context, agent_results],
                     start_to_close_timeout=timedelta(minutes=3), retry_policy=NO_RETRY,
@@ -177,3 +192,30 @@ class RunWorkflow:
                 start_to_close_timeout=timedelta(seconds=30), retry_policy=NO_RETRY,
             )
         return outcome
+
+
+@workflow.defn
+class ManualReportWorkflow:
+    @workflow.run
+    async def run(self, run_id: str, outcome: dict) -> None:
+        try:
+            markdown = await workflow.execute_activity(
+                report_activity, args=[run_id, outcome],
+                start_to_close_timeout=timedelta(minutes=10), retry_policy=NO_RETRY,
+            )
+            await workflow.execute_activity(
+                publish_activity, args=[run_id, markdown, outcome["success"]],
+                start_to_close_timeout=timedelta(minutes=2), retry_policy=NO_RETRY,
+            )
+            await workflow.execute_activity(
+                status_activity,
+                args=[run_id, "completed" if outcome["success"] else "failed", "done",
+                      outcome.get("error", "")],
+                start_to_close_timeout=timedelta(seconds=30), retry_policy=NO_RETRY,
+            )
+        except Exception as exc:
+            await workflow.execute_activity(
+                status_activity,
+                args=[run_id, "failed", "report", f"Manual report update failed: {exc}"],
+                start_to_close_timeout=timedelta(seconds=30), retry_policy=NO_RETRY,
+            )

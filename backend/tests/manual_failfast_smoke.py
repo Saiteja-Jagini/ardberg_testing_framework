@@ -1,4 +1,4 @@
-"""Verify Temporal cancels a sibling agent after the first failed node."""
+"""Verify a failed agent does not cancel a sibling or suppress its execution."""
 
 import asyncio
 from uuid import uuid4
@@ -21,20 +21,20 @@ async def main():
     with session_scope() as session:
         session.add(Run(
             id=run_id, repository="local/failfast", pr_number=1, installation_id=0,
-            instruction="A failed specialist must cancel the other active agent.",
+            instruction="A failed specialist must leave the other agent running.",
         ))
 
     async def fake_prepare(_run_id):
         set_run(_run_id, status="running", stage="agents")
         return {
-            "instruction": "A failed specialist must cancel the other active agent.",
+            "instruction": "A failed specialist must leave the other agent running.",
             "enabled_agents": ["builtin", "playwright"],
             "changed_files": [{"filename": "src/example.ts", "status": "modified"}],
             "files": ["src/example.ts"],
-            "behaviors": ["Failed specialist cancels a sibling"],
+            "behaviors": ["A failed specialist leaves a sibling running"],
             "analysis": {
                 "has_native_test_framework": False, "native_test_framework": "",
-                "existing_test_commands": [], "app_start_command": "", "app_ready_url": "",
+                "existing_test_commands": ["python3 -c 'print(1)'"], "app_start_command": "", "app_ready_url": "",
                 "playwright": {
                     "mode": "unsupported", "target": "none", "evidence_files": [],
                     "reason": "No executable browser target",
@@ -44,13 +44,19 @@ async def main():
 
     async def fake_choose(agent, _context):
         if agent == "builtin":
-            await asyncio.sleep(30)
+            await asyncio.sleep(1)
         else:
             await asyncio.sleep(0.4)
         return [], ""
 
     async def fake_report(_run_id, _outcome):
-        return "Local fail-fast smoke report."
+        return "Local branch isolation smoke report."
+
+    async def fake_execute(_run_id, _context, results):
+        assert [item["agent"] for item in results] == ["builtin"]
+        from app.events import emit
+        emit(_run_id, "execution", "passed", agent="executor", node="builtin-1", success=True)
+        return {"success": True, "suites": [{"name": "builtin-1", "success": True}]}
 
     async def fake_publish(_run_id, _markdown, _success):
         return None
@@ -58,6 +64,7 @@ async def main():
     orchestration.prepare_run = fake_prepare
     orchestration.generate_report = fake_report
     orchestration.publish_report = fake_publish
+    orchestration.execute_tests = fake_execute
     agents.choose = fake_choose
 
     client = await Client.connect("localhost:7233")
@@ -82,11 +89,13 @@ async def main():
     print({"outcome": outcome, "status": get_run(run_id)["status"],
            "events": [(item["agent"], item["node"], item["status"])
                       for item in events if item["node"]]})
-    assert outcome["stage"] == "agents"
+    assert outcome["stage"] == "execution"
     assert outcome["success"] is False
     assert any(item["agent"] == "playwright" and item["status"] == "failed" for item in events)
-    assert any(item["agent"] == "builtin" and item["status"] == "cancelled" for item in events)
-    assert not any(item["stage"] == "execution" for item in events)
+    assert any(item["agent"] == "builtin" and item["node"] == "validate_patch"
+               and item["status"] == "passed" for item in events)
+    assert not any(item["agent"] == "builtin" and item["status"] == "cancelled" for item in events)
+    assert any(item["stage"] == "execution" and item["status"] == "passed" for item in events)
     with session_scope() as session:
         session.execute(delete(RunEvent).where(RunEvent.run_id == run_id))
         session.execute(delete(Run).where(Run.id == run_id))

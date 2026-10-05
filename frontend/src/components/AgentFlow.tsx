@@ -50,7 +50,9 @@ export default function AgentFlow({ flow, instruction }: { flow: FlowDefinition;
   return <div className="flow-layout">
     <section className="flow-main">
       <div className="flow-heading">
-        <div><div className="eyebrow"><Activity size={14} /> LIVE WORKFLOW MAP</div><h2>Agent flow</h2><p>Follow the instruction from PR intake through each agent, execution, and reporting.</p></div>
+        <div><div className="eyebrow"><Activity size={14} /> {flow.run ? "THIS RUN’S WORKFLOW" : "REFERENCE WORKFLOW"}</div><h2>Agent flow</h2><p>{flow.run
+          ? `${flow.run.repository} PR #${flow.run.pr_number} · run ${flow.run.id.slice(0, 8)} · commit ${flow.run.head_sha.slice(0, 12)}`
+          : "Follow the instruction from PR intake through each agent, execution, and reporting."}</p></div>
         <div className="flow-status"><span className={["dot", flow.run?.status ?? "idle"].join(" ")} />{flow.run ? flow.run.status + " · " + flow.run.stage : "Reference flow"}</div>
       </div>
       <div className="flow-legend"><span><i className="legend-swatch purple" /> Instruction & context</span><span><i className="legend-swatch blue" /> Agent work</span><span><i className="legend-swatch green" /> Passed</span><span><i className="legend-swatch red" /> Failed</span><span><i className="legend-swatch gray" /> Waiting</span></div>
@@ -63,7 +65,7 @@ export default function AgentFlow({ flow, instruction }: { flow: FlowDefinition;
           <MiniMap pannable zoomable nodeStrokeWidth={2} maskColor="rgba(17,24,44,.07)" />
         </ReactFlow>
       </div>
-      <div className="flow-note">The enabled agent branches start in parallel. Nodes in each agent run in order. The first failure cancels active sibling work.</div>
+      <div className="flow-note">Built-in, Playwright, and Vitest start in parallel, with ordered nodes inside each branch. A specialist without an executable target stops at applicability; other branches continue. Browser tests start the app only when the Playwright browser branch produces runnable tests. The preview is an optional human testing path.</div>
     </section>
     <aside className="flow-inspector">
       <div className="eyebrow">NODE INSPECTOR</div>
@@ -71,10 +73,11 @@ export default function AgentFlow({ flow, instruction }: { flow: FlowDefinition;
       <p>{selectedNode?.description}</p>
       <div className="inspector-status"><span className={["status-badge", selectedNode?.status ?? "not_started"].join(" ")}>{selectedNode?.status.replaceAll("_", " ")}</span><span>{selectedNode?.group}</span></div>
       <div className="inspector-divider" />
-      <div className="eyebrow">INSTRUCTION PASSED TO AGENTS</div>
-      <div className="instruction-card">{flow.run?.instruction || instruction || "Enter a testing instruction in the Workspace tab. It is saved with the run and passed to each enabled agent after shared preflight."}</div>
+      <div className="eyebrow">{flow.run?.context?.instruction_source === "inferred" ? "INFERRED PR REVIEW GOAL" : flow.run?.context?.instruction_source === "automatic_fallback" ? "AUTOMATIC REVIEW GOAL · FEATURE INTENT UNCLEAR" : "INSTRUCTION PASSED TO AGENTS"}</div>
+      <div className="instruction-card">{flow.run?.instruction || instruction || "Leave the testing intent blank to derive a review goal from the PR, or enter a specific behavior and expected result."}</div>
       {selectedNode?.event && <><div className="inspector-divider" /><div className="eyebrow">LATEST NODE EVENT</div><div className="event-meta">Event #{selectedNode.event.id} · {new Date(selectedNode.event.created_at).toLocaleString()}</div><div className="event-meta">Boolean result: {selectedNode.event.success === null ? "pending" : String(selectedNode.event.success)}</div><pre className="event-json">{JSON.stringify(selectedNode.event.detail, null, 2)}</pre></>}
       {analysis && <><div className="inspector-divider" /><div className="eyebrow">SHARED CONTEXT</div><p className="context-summary">{String(analysis.application_framework ?? "Framework unknown")} · {String(analysis.native_test_framework ?? "Tests unknown")}</p><span className="muted-small">Pinned commit {String(flow.run?.context?.head_sha ?? "").slice(0, 12)}</span></>}
+      {Boolean(flow.run?.context?.impact_map) && <><div className="inspector-divider" /><div className="eyebrow">IMPACT MAP FOR THIS RUN</div><p className="context-summary">{String((flow.run?.context.impact_map as { feature_summary?: string }).feature_summary ?? "Impact not established")}</p></>}
     </aside>
   </div>;
 }

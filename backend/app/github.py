@@ -85,6 +85,21 @@ class GitHubApp:
     async def pull_request(self, repository: str, number: int, token: str) -> dict:
         return (await self._request("GET", f"/repos/{repository}/pulls/{number}", token=token)).json()
 
+    async def pull_request_commits(self, repository: str, number: int,
+                                   token: str) -> tuple[list[dict], bool]:
+        commits = []
+        for page in range(1, 4):
+            batch = (await self._request(
+                "GET", f"/repos/{repository}/pulls/{number}/commits", token=token,
+                params={"per_page": 100, "page": page},
+            )).json()
+            commits.extend({"sha": item["sha"],
+                            "message": item.get("commit", {}).get("message", "")[:1000]}
+                           for item in batch)
+            if len(batch) < 100:
+                return commits, False
+        return commits, True
+
     async def git_commit(self, repository: str, sha: str, token: str) -> dict:
         return (await self._request("GET", f"/repos/{repository}/git/commits/{sha}",
                                     token=token)).json()

@@ -56,15 +56,3 @@ def get_events(run_id: str, after: int = 0) -> list[dict]:
             "node": item.node, "status": item.status, "success": item.success,
             "detail": item.detail, "created_at": item.created_at.isoformat(),
         } for item in records]
-
-
-def cancel_running_nodes(run_id: str):
-    events = get_events(run_id)
-    latest = {}
-    for event in events:
-        if event["node"]:
-            latest[(event["agent"], event["node"])] = event
-    for (agent, node), event in latest.items():
-        if event["status"] == "running":
-            emit(run_id, event["stage"], "cancelled", agent=agent, node=node,
-                 detail={"reason": "Global fail-fast"})

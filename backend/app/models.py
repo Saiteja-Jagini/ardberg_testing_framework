@@ -46,6 +46,45 @@ class RunEvent(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class InteractivePreview(Base):
+    __tablename__ = "interactive_previews"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    run_id: Mapped[str] = mapped_column(ForeignKey("runs.id"), index=True)
+    status: Mapped[str] = mapped_column(String(30), default="queued")
+    command: Mapped[str] = mapped_column(Text)
+    port: Mapped[int] = mapped_column(Integer)
+    ready_path: Mapped[str] = mapped_column(String(500), default="/")
+    url: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    container: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    database_container: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    network: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class InteractivePreviewOptions(Base):
+    __tablename__ = "interactive_preview_options"
+
+    preview_id: Mapped[str] = mapped_column(ForeignKey("interactive_previews.id"), primary_key=True)
+    environment: Mapped[dict] = mapped_column(JSON, default=dict)
+    setup_commands: Mapped[list | None] = mapped_column(JSON, nullable=True)
+
+
+class ManualObservation(Base):
+    __tablename__ = "manual_observations"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    run_id: Mapped[str] = mapped_column(ForeignKey("runs.id"), index=True)
+    preview_id: Mapped[str] = mapped_column(ForeignKey("interactive_previews.id"))
+    verdict: Mapped[str] = mapped_column(String(20))
+    steps: Mapped[str] = mapped_column(Text)
+    expected: Mapped[str] = mapped_column(Text)
+    actual: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class PullRequestSettings(Base):
     __tablename__ = "pull_request_settings"
 

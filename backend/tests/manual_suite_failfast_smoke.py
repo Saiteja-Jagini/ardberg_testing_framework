@@ -1,4 +1,4 @@
-"""Verify a failed suite stops its sibling runner process."""
+"""Verify a failed suite leaves a concurrently running sibling to finish."""
 
 import asyncio
 import subprocess
@@ -21,7 +21,7 @@ async def main():
         session.add(Run(
             id=run_id, repository="local/suite-failfast", pr_number=1,
             installation_id=0,
-            instruction="A failing suite must stop its concurrently running sibling.",
+            instruction="A failing suite must leave its concurrently running sibling active.",
         ))
     source = run_dir(run_id) / "source"
     source.mkdir()
@@ -38,16 +38,20 @@ async def main():
         "agent": "builtin", "patch": {"patch": "", "test_files": []},
         "commands": [
             "python3 -c 'raise AssertionError(\"expected failure\")'",
-            "python3 -c 'import time; time.sleep(30)'",
+            "python3 -c 'import time; time.sleep(2); print(\"sibling completed\")'",
         ],
-    }])
+    }, {"agent": "vitest", "patch": {"patch": "", "test_files": []},
+        "commands": ["echo invalid-command"]}])
     elapsed = monotonic() - started
     events = get_events(run_id)
-    assert not result["success"] and elapsed < 20, result
+    assert not result["success"], result
     assert any(item["node"] == "builtin-1" and item["status"] == "failed"
                for item in events)
-    assert any(item["node"] == "builtin-2" and item["status"] == "cancelled"
+    assert any(item["node"] == "builtin-2" and item["status"] == "passed"
                for item in events)
+    assert any(item["node"] == "vitest-commands" and item["status"] == "failed"
+               for item in events)
+    assert result["rejected_commands"][0]["agent"] == "vitest"
     assert any(item["node"] == "collect" and item["success"] is True for item in events)
     print({"elapsed_seconds": round(elapsed, 2), "result": result})
     with session_scope() as session:

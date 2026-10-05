@@ -14,14 +14,67 @@ class PreviewRequest(BaseModel):
 class CreateRunRequest(BaseModel):
     repository: str
     pr_number: int = Field(gt=0)
-    instruction: str = Field(min_length=20, max_length=12000)
+    instruction: str = Field(default="", max_length=12000)
     selected_frameworks: list[Literal["playwright", "vitest"]] = Field(default_factory=list)
 
     @field_validator("instruction")
     @classmethod
     def meaningful_instruction(cls, value: str) -> str:
-        if len(value.split()) < 4:
+        value = value.strip()
+        if value and (len(value) < 20 or len(value.split()) < 4):
             raise ValueError("Describe the behavior and expected result in at least four words")
+        return value
+
+
+class StartInteractivePreviewRequest(BaseModel):
+    command: str = Field(default="", max_length=1000)
+    port: int | None = Field(default=None, ge=1, le=65535)
+    ready_path: str = Field(default="", max_length=500)
+    environment: dict[str, str] = Field(default_factory=dict)
+    setup_commands: list[str] | None = Field(default=None, max_length=20)
+
+    @field_validator("command", "ready_path")
+    @classmethod
+    def no_control_characters(cls, value: str) -> str:
+        if any(ord(char) < 32 for char in value):
+            raise ValueError("Control characters are not allowed")
+        return value.strip()
+
+    @field_validator("environment")
+    @classmethod
+    def valid_environment(cls, value: dict[str, str]) -> dict[str, str]:
+        import re
+        if len(value) > 40:
+            raise ValueError("At most 40 preview environment values are allowed")
+        for key, content in value.items():
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+                raise ValueError(f"Invalid environment variable name: {key}")
+            if len(content) > 2000 or any(ord(char) < 32 for char in content):
+                raise ValueError(f"Invalid environment variable value for {key}")
+        return value
+
+    @field_validator("setup_commands")
+    @classmethod
+    def valid_setup_commands(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return value
+        if any(not command.strip() or len(command) > 1000 or
+               any(ord(char) < 32 for char in command) for command in value):
+            raise ValueError("Each preview setup command must be one nonempty line")
+        return [command.strip() for command in value]
+
+
+class ManualObservationRequest(BaseModel):
+    verdict: Literal["passed", "failed", "blocked"]
+    steps: str = Field(min_length=5, max_length=5000)
+    expected: str = Field(min_length=3, max_length=5000)
+    actual: str = Field(min_length=3, max_length=5000)
+
+    @field_validator("steps", "expected", "actual")
+    @classmethod
+    def nonempty_observation(cls, value: str) -> str:
+        if len(value.strip()) < 3:
+            raise ValueError("Manual observation fields must describe an actual test")
         return value.strip()
 
 
@@ -83,6 +136,10 @@ class TestService(BaseModel):
     evidence_files: list[str]
     connection_environment_keys: list[str]
     setup_commands: list[str] = Field(default_factory=list)
+    required_extensions: list[str] = Field(default_factory=list)
+    baseline_setup_commands: list[str] = Field(default_factory=list)
+    seed_commands: list[str] = Field(default_factory=list)
+    upgrade_commands: list[str] = Field(default_factory=list)
 
 
 class FrameworkAnalysis(BaseModel):
@@ -93,8 +150,12 @@ class FrameworkAnalysis(BaseModel):
     has_native_test_framework: bool
     install_commands: list[str]
     existing_test_commands: list[str]
+    security_check_commands: list[str] = Field(default_factory=list)
     app_start_command: str
     app_ready_url: str
+    interactive_preview_command: str = ""
+    interactive_preview_ready_url: str = ""
+    interactive_preview_setup_commands: list[str] = Field(default_factory=list)
     test_environment: list[TestEnvironmentValue]
     services: list[TestService] = Field(default_factory=list)
     playwright: "SpecialistDecision"
@@ -118,6 +179,57 @@ class InstructionAssessment(BaseModel):
     testable: bool
     reason: str
     behaviors: list[str]
+
+
+class ImpactClaim(BaseModel):
+    text: str
+    evidence_files: list[str]
+    origin: Literal["pr_description", "commit_message", "code", "user_instruction"]
+
+
+class ImpactArea(BaseModel):
+    surface: Literal["frontend", "api", "database", "security", "cross_cutting"]
+    summary: str
+    changed_files: list[str]
+    related_files: list[str] = Field(default_factory=list)
+    confidence: Literal["confirmed", "potential"]
+    reason: str
+
+
+class BrowserReviewTarget(BaseModel):
+    path: str
+    evidence_files: list[str]
+    reason: str
+
+
+class ImpactCheck(BaseModel):
+    surface: Literal["frontend", "api", "database", "security", "cross_cutting"]
+    behavior: str
+    expected: str
+    source_files: list[str]
+    method: Literal["native_test", "playwright", "vitest", "manual"]
+    prerequisites: list[str] = Field(default_factory=list)
+
+
+class ImpactMap(BaseModel):
+    feature_summary: str
+    claims: list[ImpactClaim] = Field(default_factory=list)
+    areas: list[ImpactArea] = Field(default_factory=list)
+    browser_targets: list[BrowserReviewTarget] = Field(default_factory=list)
+    checks: list[ImpactCheck] = Field(default_factory=list)
+    review_gaps: list[str] = Field(default_factory=list)
+
+
+class SecurityConcern(BaseModel):
+    path: str
+    evidence_quote: str
+    concern: str
+    test_to_confirm: str
+
+
+class SecurityReview(BaseModel):
+    concerns: list[SecurityConcern] = Field(default_factory=list)
+    uncovered: list[str] = Field(default_factory=list)
 
 
 class ReportDraft(BaseModel):

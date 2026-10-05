@@ -9,8 +9,10 @@ from types import SimpleNamespace
 from uuid import uuid4
 import json
 import zipfile
+from urllib.error import HTTPError
 
 import pytest
+from sqlalchemy import delete
 from fastapi.testclient import TestClient
 
 from app import github
@@ -20,11 +22,12 @@ from app.artifacts import write_artifact
 from app.db import init_db, session_scope
 from app.events import emit, get_events, get_run, set_run
 from app.flow import definition
-from app.models import PullRequestSettings, Run
+from app.models import InteractivePreview, InteractivePreviewOptions, ManualObservation, PullRequestSettings, Run, RunEvent
 from app.publication import publish_generated_tests
 from app.report import _check_claim_links, evidence_artifact_excerpts, generate_report, publish_report
-from app.runner import _apply_patches, _structured_result, _suite_commands, _test_environment
+from app.runner import _apply_patches, _postgres_image, _structured_result, _suite_commands, _test_environment
 from app.inspection import analyze_repository, hydrate_evidence, prefer_fresh_database_schema_push, selected_file_context, select_agents, specialist_feasibility, validate_services
+from app.interactive_preview import _responds, preview_defaults
 from app.schemas import CommandSelection, EvidenceClaim, FrameworkAnalysis, GeneratedPatch, ReportDraft, ReportVerification
 from app.schemas import TestCase as CaseSchema, TestPlan as PlanSchema, TestService as ServiceSchema
 
@@ -152,12 +155,111 @@ def test_patch_paths_and_conflict(tmp_path: Path):
         _patch_paths(patch.replace("--- /dev/null", "--- a/src/login.ts"))
     with pytest.raises(ValueError, match="regular, non-executable"):
         _patch_paths(patch.replace("new file mode 100644", "new file mode 120000"))
-    _apply_patches(tmp_path, results)
+    accepted, rejected = _apply_patches(tmp_path, results)
+    assert accepted == results and not rejected
     assert (tmp_path / "tests" / "login.test.ts").read_text() == "export const expected = true;\n"
     second_workspace = tmp_path / "second"
     second_workspace.mkdir()
-    with pytest.raises(ValueError, match="overlap"):
-        _apply_patches(second_workspace, results + results)
+    accepted, rejected = _apply_patches(second_workspace, results + results)
+    assert accepted == results
+    assert len(rejected) == 1 and "overlap" in rejected[0]["error"]
+
+
+def test_interactive_preview_api_records_human_evidence(tmp_path: Path, monkeypatch):
+    init_db()
+    queued = []
+
+    class FakeHandle:
+        async def signal(self, _signal):
+            queued.append("stop")
+
+    class FakeClient:
+        async def start_workflow(self, _workflow, *args, **kwargs):
+            queued.append((args, kwargs))
+
+        def get_workflow_handle(self, _workflow_id):
+            return FakeHandle()
+
+    async def connect(_address):
+        return FakeClient()
+
+    monkeypatch.setattr("app.api.Client.connect", connect)
+    source = tmp_path / "source"
+    source.mkdir()
+    run_id = str(uuid4())
+    with session_scope() as session:
+        session.add(Run(id=run_id, repository="local/preview-api", pr_number=1,
+                        installation_id=0, instruction="Test the preview route and human verdict.",
+                        status="completed", context={
+                            "source_path": str(source), "analysis": {
+                                "app_start_command": "python3 -m http.server 8765 --bind 0.0.0.0",
+                                "app_ready_url": "http://127.0.0.1:8765/health",
+                            },
+                        }))
+    write_artifact(run_id, "outcome.json", json.dumps({"success": True, "agents": []}))
+    preview = None
+    try:
+        with TestClient(app) as client:
+            response = client.post(f"/api/runs/{run_id}/interactive-preview",
+                                   json={"environment": {"APPLICATION_MODE": "local"},
+                                         "setup_commands": ["echo prepared"]})
+            assert response.status_code == 200, response.text
+            preview = response.json()
+            assert preview["port"] == 8765 and preview["ready_path"] == "/health"
+            with session_scope() as session:
+                options = session.get(InteractivePreviewOptions, preview["id"])
+                assert options.environment == {"APPLICATION_MODE": "local"}
+                assert options.setup_commands == ["echo prepared"]
+            assert client.post(f"/api/runs/{run_id}/interactive-preview",
+                               json={"environment": {"DATABASE_URL": "postgres://elsewhere"}}).status_code == 422
+            response = client.post(f"/api/runs/{run_id}/interactive-preview/observations",
+                                   json={"verdict": "failed", "steps": "Open the feature page",
+                                         "expected": "The page loads", "actual": "The page is blank"})
+            assert response.status_code == 200, response.text
+            assert response.json()["report"]["queued"] is True
+            response = client.get(f"/api/runs/{run_id}/interactive-preview")
+            assert response.status_code == 200
+            assert response.json()["observations"][0]["verdict"] == "failed"
+            assert len(queued) == 2
+            assert queued[1][1]["args"][1]["success"] is False
+            response = client.post(f"/api/runs/{run_id}/interactive-preview/stop")
+            assert response.status_code == 200
+            assert queued[-1] == "stop"
+    finally:
+        with session_scope() as session:
+            session.execute(delete(ManualObservation).where(ManualObservation.run_id == run_id))
+            if preview:
+                session.execute(delete(InteractivePreviewOptions).where(
+                    InteractivePreviewOptions.preview_id == preview["id"]))
+            session.execute(delete(InteractivePreview).where(InteractivePreview.run_id == run_id))
+            session.execute(delete(RunEvent).where(RunEvent.run_id == run_id))
+            session.execute(delete(Run).where(Run.id == run_id))
+
+
+def test_postgres_image_follows_repository_extension_evidence(tmp_path: Path):
+    from app.config import settings
+    service = {"kind": "postgres", "required_extensions": []}
+    assert _postgres_image(tmp_path, service) == settings.postgres_test_image
+    migration = tmp_path / "backend" / "scripts" / "db" / "setup.sql"
+    migration.parent.mkdir(parents=True)
+    migration.write_text("CREATE EXTENSION IF NOT EXISTS vector;", encoding="utf-8")
+    assert _postgres_image(tmp_path, service) == settings.postgres_vector_image
+
+
+def test_preview_readiness_rejects_missing_page(monkeypatch):
+    def response(status):
+        raise HTTPError("http://127.0.0.1:1234/", status, "status", {}, None)
+
+    monkeypatch.setattr("app.interactive_preview.urlopen", lambda *_args, **_kwargs: response(404))
+    assert _responds("http://127.0.0.1:1234/") is False
+    monkeypatch.setattr("app.interactive_preview.urlopen", lambda *_args, **_kwargs: response(401))
+    assert _responds("http://127.0.0.1:1234/") is True
+    assert preview_defaults({"analysis": {"interactive_preview_command": "pnpm dev:all",
+                                          "interactive_preview_ready_url": "http://localhost:4200/app",
+                                          "interactive_preview_setup_commands": ["pnpm db:setup"]}}) == {
+        "command": "pnpm dev:all", "port": 4200, "ready_path": "/app",
+        "setup_commands": ["pnpm db:setup"],
+    }
 
 
 def test_context_includes_unchanged_importers_of_changed_module(tmp_path: Path):
@@ -393,11 +495,31 @@ def test_specialist_selection_respects_executable_targets():
         },
     }
     enabled, inactive = select_agents(analysis, ["src/example.ts"], [])
-    assert enabled == ["builtin", "vitest"]
+    assert enabled == ["builtin", "playwright", "vitest"]
     assert "playwright" in inactive
+    run_id = new_run()
+    context = {"analysis": analysis, "files": ["src/example.ts"],
+               "selected_frameworks": [], "enabled_agents": enabled,
+               "instruction": "A member sees only approved projects"}
+    set_run(run_id, context=context)
+    skipped = asyncio.run(build_agent_graph("playwright").compile().ainvoke(
+        {"run_id": run_id, "agent": "playwright", "context": context, "failed": False},
+    ))
+    assert skipped["skipped"] is True and not skipped.get("failed")
+    assert skipped["skip_reason"] == "No isolated service"
+    nodes = {node["id"]: node for node in definition(run_id)["nodes"]}
+    assert nodes["playwright.applicability"]["status"] == "not_selected"
+    assert nodes["playwright.select_skills"]["status"] == "not_selected"
     analysis["has_native_test_framework"] = False
-    with pytest.raises(ValueError, match="playwright has no valid executable adapter"):
-        select_agents(analysis, ["src/example.ts"], ["playwright"])
+    enabled, inactive = select_agents(analysis, ["src/example.ts"], ["playwright"])
+    assert enabled == ["builtin", "playwright", "vitest"]
+    assert inactive["vitest"] == "Not selected by user"
+    context["selected_frameworks"] = ["playwright"]
+    failed = asyncio.run(build_agent_graph("playwright").compile().ainvoke(
+        {"run_id": run_id, "agent": "playwright", "context": context, "failed": False},
+    ))
+    assert failed["failed"] is True
+    assert "No isolated service" in failed["error"]
 
 
 def test_database_service_requires_repository_evidence_and_supplies_test_url():
@@ -420,7 +542,7 @@ def test_database_service_requires_repository_evidence_and_supplies_test_url():
     files = ["ci.yml", "src/access.ts"]
     validate_services(analysis, files, {"ci.yml": "services: postgres:16"})
     valid, _ = select_agents(analysis.model_dump(), files, [])
-    assert valid == ["builtin", "vitest"]
+    assert valid == ["builtin", "playwright", "vitest"]
     url = _test_environment(analysis.model_dump(), "a test password")["DATABASE_URL"]
     assert url == "postgresql://ardberg:a%20test%20password@postgres:5432/ardberg_test"
     analysis.services[0].setup_commands = ["pnpm db:migrate"]

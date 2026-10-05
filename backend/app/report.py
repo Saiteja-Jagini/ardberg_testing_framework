@@ -8,7 +8,7 @@ from .db import session_scope
 from .events import emit, get_events, get_run, set_run
 from .github import GitHubApp
 from .llm import parse
-from .models import PullRequestSettings, Run
+from .models import ManualObservation, PullRequestSettings, Run
 from .schemas import ReportDraft, ReportVerification
 
 
@@ -67,7 +67,7 @@ def evidence_artifact_excerpts(run_id: str, events: list[dict]) -> dict[str, str
         try:
             artifact = artifact_path(run_id, relative)
             if not artifact.is_file() or artifact.suffix.lower() not in {
-                ".txt", ".log", ".json", ".md", ".diff",
+                ".txt", ".log", ".json", ".md", ".diff", ".sql",
             }:
                 continue
             with artifact.open("r", encoding="utf-8", errors="replace") as stream:
@@ -118,15 +118,17 @@ def _check_claim_links(run_id: str, draft: ReportDraft, events: list[dict],
 
 
 def evidence_counts(events: list[dict], outcome: dict) -> dict:
+    suite_nodes = {item["node"] for item in events
+                   if item["stage"] == "execution" and item["agent"] == "executor"
+                   and item["status"] == "running" and item["node"] != "setup"
+                   and isinstance((item.get("detail") or {}).get("command"), str)}
     suites = [item for item in events if item["stage"] == "execution"
-              and item["agent"] == "executor" and item["node"]
-              and item["node"] not in {"apply_patches", "start_runner", "setup",
-                                       "postgres_ready", "collect"}]
+              and item["agent"] == "executor" and item["node"] in suite_nodes]
     latest = {}
     for item in suites:
         latest[item["node"]] = item
     cases = sum(len(result.get("plan", {}).get("cases", []))
-                for result in outcome.get("agents", []))
+                for result in outcome.get("agents", []) if not result.get("failed"))
     return {
         "generated_cases_from_completed_agents": cases,
         "suites_started": sum(any(event["node"] == node and event["status"] == "running"
@@ -146,7 +148,15 @@ def classify_failure(events: list[dict]) -> list[dict]:
         detail = event["detail"]
         error = str(detail.get("error", "")).lower()
         rule = "Stage and node outcome"
-        if "adapter" in error or "executable target" in error:
+        if stage == "manual":
+            category = ("reviewer_observation" if event["agent"] == "reviewer"
+                        else "preview_environment_failure")
+            rule = ("Human-recorded outcome" if event["agent"] == "reviewer"
+                    else "Interactive preview did not start or stop cleanly")
+        elif stage == "security":
+            category = "security_scan_failure_or_finding"
+            rule = "Repository-declared security command exited unsuccessfully; inspect its log"
+        elif "adapter" in error or "executable target" in error:
             category = "unsupported_adapter"
         elif stage == "preflight":
             category = "preflight"
@@ -190,7 +200,8 @@ def classify_failure(events: list[dict]) -> list[dict]:
         else:
             category = "orchestration_or_unknown"
         classifications.append({"event_id": event["id"], "category": category,
-                                "reason": detail.get("error") or detail.get("command") or stage,
+                                "reason": detail.get("error") or detail.get("actual")
+                                or detail.get("command") or stage,
                                 "evidence": detail.get("structured_result") or detail.get("log"),
                                 "rule": rule})
     return classifications
@@ -198,6 +209,13 @@ def classify_failure(events: list[dict]) -> list[dict]:
 
 async def generate_report(run_id: str, outcome: dict) -> str:
     run = get_run(run_id)
+    with session_scope() as session:
+        manual_observations = [{"id": item.id, "verdict": item.verdict,
+                                "steps": item.steps, "expected": item.expected,
+                                "actual": item.actual, "preview_id": item.preview_id}
+                               for item in session.scalars(select(ManualObservation).where(
+                                   ManualObservation.run_id == run_id,
+                               ).order_by(ManualObservation.created_at)).all()]
     events = get_events(run_id)
     for item in events:
         item["run_id"] = run_id
@@ -211,13 +229,23 @@ async def generate_report(run_id: str, outcome: dict) -> str:
         "title": run["title"], "head_sha": run["head_sha"],
         "original_head_sha": run["context"].get("head_sha"),
         "published_test_sha": run["context"].get("published_test_sha"),
-        "instruction": run["instruction"], "context": run["context"],
+        "instruction": run["context"].get("instruction", run["instruction"]),
+        "user_instruction": run["instruction"],
+        "instruction_source": run["context"].get("instruction_source", "user"),
+        "context": run["context"],
         "outcome": outcome, "events": events, "classifications": classifications,
+        "manual_observations": manual_observations,
         "evidence_counts": evidence_counts(events, outcome),
         "changed_documents": changed_document_context(run["context"]),
         "artifact_excerpts": evidence_artifact_excerpts(run_id, events),
     }
     prompt = (__import__("pathlib").Path(__file__).parent / "prompts" / "report.txt").read_text(encoding="utf-8")
+    if payload["instruction_source"] != "user":
+        prompt += ("\nThe user supplied no testing intent. The review instruction in this "
+                   "payload was inferred from PR evidence or is an automatic fallback. "
+                   "Describe it as inferred, not as a user requirement. If the source is "
+                   "automatic_fallback, say that the expected feature behavior could not "
+                   "be established, even when available repository tests passed.")
     prompt += ("\nWhen the payload contains correction, revise the entire report to remove "
                "or narrow every flagged claim. Cite only evidence present in the payload. "
                "Prefer a shorter accurate report to an unsupported conclusion.")
@@ -237,7 +265,7 @@ async def generate_report(run_id: str, outcome: dict) -> str:
             artifact_excerpts = dict(payload["artifact_excerpts"])
             for path in claimed_artifacts:
                 artifact = artifact_path(run_id, path)
-                if artifact.suffix.lower() in {".txt", ".log", ".json", ".md", ".diff"}:
+                if artifact.suffix.lower() in {".txt", ".log", ".json", ".md", ".diff", ".sql"}:
                     artifact_excerpts[path] = artifact.read_text(
                         encoding="utf-8", errors="replace"
                     )[:20000]
@@ -248,8 +276,12 @@ async def generate_report(run_id: str, outcome: dict) -> str:
                 "title": run["title"], "head_sha": run["head_sha"],
                 "original_head_sha": run["context"].get("head_sha"),
                 "published_test_sha": run["context"].get("published_test_sha"),
-                "instruction": run["instruction"],
+                "instruction": run["context"].get("instruction", run["instruction"]),
+                "user_instruction": run["instruction"],
+                "instruction_source": run["context"].get("instruction_source", "user"),
                 "analysis": run["context"].get("analysis", {}),
+                "impact_map": run["context"].get("impact_map", {}),
+                "api_contract": run["context"].get("api_contract", {}),
                 "selected_frameworks": run["selected_frameworks"],
                 "source_file_inventory": run["context"].get("files", []),
                 "changed_files": run["context"].get("changed_files", []),
@@ -262,6 +294,7 @@ async def generate_report(run_id: str, outcome: dict) -> str:
                 "changed_documents": payload["changed_documents"],
                 "artifact_excerpts": artifact_excerpts,
                 "evidence_counts": payload["evidence_counts"],
+                "manual_observations": manual_observations,
             }, ReportVerification)
         if not link_errors and verification and verification.supported:
             emit(run_id, "report", "passed", agent="report", node="verify_evidence",
@@ -302,7 +335,7 @@ async def publish_report(run_id: str, markdown: str, success: bool):
             return f"[{label}]({dashboard}#artifacts)"
         return f"{label} (\x60{path}\x60, available in the local dashboard)"
     github_markdown = re.sub(
-        r"\[([^\]]+)\]\(((?:context|patches|logs|evidence)/[^)]+)\)",
+        r"\[([^\]]+)\]\(((?:context|patches|logs|evidence|manual)/[^)]+)\)",
         github_artifact_link, markdown,
     )
     body = f"<!-- ardberg-report -->\n{github_markdown}"

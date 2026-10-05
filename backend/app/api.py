@@ -3,6 +3,7 @@ import json
 import re
 from contextlib import asynccontextmanager
 from pathlib import Path
+from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -21,7 +22,11 @@ from .github import GitHubApp, GitHubError, parse_github_url, verify_webhook
 from .models import GitHubInstallation, GitHubUser, PullRequestSettings, Run, WebhookDelivery
 from .schemas import CreateRunRequest, PreviewRequest, ResolveRequest
 from .inspection import preview_repository
-from .workflow import RunWorkflow
+from .interactive_preview import PreviewWorkflow, preview_defaults, preview_for_run, preview_record
+from .models import InteractivePreview, InteractivePreviewOptions, ManualObservation
+from .runner import _command
+from .schemas import ManualObservationRequest, StartInteractivePreviewRequest
+from .workflow import ManualReportWorkflow, RunWorkflow
 
 
 @asynccontextmanager
@@ -237,6 +242,171 @@ def read_events(run_id: str, after: int = 0):
         raise HTTPException(404, str(exc)) from exc
 
 
+@app.get("/api/runs/{run_id}/interactive-preview")
+def read_interactive_preview(run_id: str):
+    try:
+        return preview_for_run(run_id)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@app.post("/api/runs/{run_id}/interactive-preview")
+async def start_interactive_preview(run_id: str, request: StartInteractivePreviewRequest):
+    try:
+        run = get_run(run_id)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    context = run["context"] or {}
+    source_path = context.get("source_path")
+    if not context.get("analysis") or not source_path or not Path(source_path).is_dir():
+        raise HTTPException(409, "Wait for PR preflight to produce a pinned source snapshot")
+    defaults = preview_defaults(context)
+    command = request.command or defaults["command"]
+    if not command:
+        raise HTTPException(422, "Enter an application start command for this repository")
+    port = request.port or defaults["port"]
+    ready_path = request.ready_path or defaults["ready_path"]
+    if not ready_path.startswith("/") or ready_path.startswith("//"):
+        raise HTTPException(422, "Ready path must start with a single slash")
+    protected = {"DATABASE_URL", "POSTGRES_URL", "PGHOST", "PGPORT", "PGUSER",
+                 "PGPASSWORD", "PGDATABASE"}
+    for service in context["analysis"].get("services", []):
+        protected.update(key.upper() for key in service.get("connection_environment_keys", []))
+    if protected & {key.upper() for key in request.environment}:
+        raise HTTPException(422, "Preview database connection is managed by the disposable service")
+    with session_scope() as session:
+        existing = session.scalar(select(InteractivePreview).where(
+            InteractivePreview.run_id == run_id,
+            InteractivePreview.status.in_(["queued", "starting", "ready", "stopping"]),
+        ))
+        if existing:
+            raise HTTPException(409, "An interactive preview is already active for this run")
+        item = InteractivePreview(run_id=run_id, command=command, port=port,
+                                  ready_path=ready_path)
+        session.add(item)
+        session.flush()
+        preview_id = item.id
+        session.add(InteractivePreviewOptions(
+            preview_id=preview_id, environment=request.environment,
+            setup_commands=request.setup_commands,
+        ))
+    try:
+        client = await Client.connect(settings.temporal_address)
+        await client.start_workflow(PreviewWorkflow.run, preview_id,
+                                    id=f"ardberg-preview-{preview_id}",
+                                    task_queue=settings.temporal_task_queue)
+    except Exception as exc:
+        with session_scope() as session:
+            item = session.get(InteractivePreview, preview_id)
+            item.status = "failed"
+            item.error = f"Could not queue preview: {exc}"
+        raise HTTPException(503, f"Preview worker unavailable: {exc}") from exc
+    return preview_record(preview_id)
+
+
+@app.post("/api/runs/{run_id}/interactive-preview/stop")
+async def stop_interactive_preview(run_id: str):
+    data = preview_for_run(run_id)
+    preview = data["session"]
+    if not preview or preview["status"] not in {"queued", "starting", "ready", "stopping"}:
+        raise HTTPException(409, "No active preview to stop")
+    try:
+        client = await Client.connect(settings.temporal_address)
+        await client.get_workflow_handle(f"ardberg-preview-{preview['id']}").signal(PreviewWorkflow.stop)
+        with session_scope() as session:
+            session.get(InteractivePreview, preview["id"]).status = "stopping"
+    except Exception as exc:
+        raise HTTPException(503, f"Could not stop preview: {exc}") from exc
+    return {"accepted": True}
+
+
+@app.get("/api/runs/{run_id}/interactive-preview/logs")
+async def interactive_preview_logs(run_id: str):
+    data = preview_for_run(run_id)
+    preview = data["session"]
+    if not preview:
+        raise HTTPException(404, "No preview exists for this run")
+    if preview["status"] in {"stopped", "failed"}:
+        relative = f"manual/{preview['id']}/application.log"
+        path = artifact_path(run_id, relative)
+        return {"text": path.read_text(encoding="utf-8", errors="replace")[-20000:]
+                if path.is_file() else "", "artifact": relative if path.is_file() else None}
+    with session_scope() as session:
+        container = session.get(InteractivePreview, preview["id"]).container
+    if not container:
+        return {"text": "Preview has not started yet", "artifact": None}
+    try:
+        code, output = await _command("docker", "exec", container, "cat",
+                                      "/tmp/ardberg-preview.log", timeout=15)
+        return {"text": output[-20000:] if code == 0 else "Application log is not ready", "artifact": None}
+    except (OSError, TimeoutError):
+        return {"text": "Application log is unavailable", "artifact": None}
+
+
+async def _queue_manual_report(run_id: str) -> dict:
+    run = get_run(run_id)
+    if run["status"] not in {"completed", "failed"}:
+        return {"queued": False, "reason": "Automated review is still running"}
+    saved = artifact_path(run_id, "outcome.json")
+    if not saved.is_file():
+        return {"queued": False, "reason": "Automated outcome is not available yet"}
+    outcome = json.loads(saved.read_text(encoding="utf-8"))
+    with session_scope() as session:
+        observations = session.scalars(select(ManualObservation).where(
+            ManualObservation.run_id == run_id,
+        ).order_by(ManualObservation.created_at)).all()
+        verdicts = [item.verdict for item in observations]
+    outcome["manual_review"] = {"verdicts": verdicts,
+                                "all_passed": all(verdict == "passed" for verdict in verdicts)}
+    outcome["success"] = bool(outcome["success"] and outcome["manual_review"]["all_passed"])
+    if not outcome["manual_review"]["all_passed"]:
+        outcome["error"] = "; ".join(filter(None, [outcome.get("error"),
+                                                    "Manual review did not pass"]))
+    client = await Client.connect(settings.temporal_address)
+    await client.start_workflow(ManualReportWorkflow.run, args=[run_id, outcome],
+                                id=f"ardberg-manual-report-{uuid4()}",
+                                task_queue=settings.temporal_task_queue)
+    return {"queued": True}
+
+
+@app.post("/api/runs/{run_id}/interactive-preview/observations")
+async def record_manual_observation(run_id: str, request: ManualObservationRequest):
+    data = preview_for_run(run_id)
+    preview = data["session"]
+    if not preview:
+        raise HTTPException(409, "Start a preview before recording manual evidence")
+    with session_scope() as session:
+        observation = ManualObservation(
+            run_id=run_id, preview_id=preview["id"], verdict=request.verdict,
+            steps=request.steps.strip(), expected=request.expected.strip(),
+            actual=request.actual.strip(),
+        )
+        session.add(observation)
+        session.flush()
+        observation_id = observation.id
+    from .events import emit
+    emit(run_id, "manual", "passed" if request.verdict == "passed" else "failed",
+         agent="reviewer", node="observation", success=request.verdict == "passed",
+         detail={"observation_id": observation_id, "preview_id": preview["id"],
+                 "verdict": request.verdict, "steps": request.steps,
+                 "expected": request.expected, "actual": request.actual})
+    try:
+        report = await _queue_manual_report(run_id)
+    except Exception as exc:
+        report = {"queued": False, "reason": f"Could not queue report update: {exc}"}
+    return {"observation_id": observation_id, "report": report}
+
+
+@app.post("/api/runs/{run_id}/interactive-preview/refresh-report")
+async def refresh_manual_report(run_id: str):
+    try:
+        return await _queue_manual_report(run_id)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(503, f"Could not queue report update: {exc}") from exc
+
+
 @app.get("/api/runs/{run_id}/stream")
 async def stream_events(run_id: str, request: Request, after: int = 0):
     try:
@@ -320,7 +490,7 @@ async def github_webhook(request: Request):
             PullRequestSettings.pr_number == number,
         ))
         if setting is None:
-            return {"accepted": False, "reason": "PR has no saved testing instruction"}
+            return {"accepted": False, "reason": "PR has no saved test settings; start its first run in the dashboard"}
         instruction, selected = setting.instruction, list(setting.selected_frameworks)
         existing = session.scalar(select(Run).where(
             Run.repository == repository, Run.pr_number == number,

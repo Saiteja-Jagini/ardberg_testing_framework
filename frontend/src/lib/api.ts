@@ -22,7 +22,8 @@ export type FlowNode = {
 export type FlowEdge = { id: string; source: string; target: string; label: string };
 export type FlowDefinition = {
   nodes: FlowNode[]; edges: FlowEdge[];
-  run: { id: string; status: string; stage: string; instruction: string; context: Record<string, unknown> } | null;
+  run: { id: string; repository: string; pr_number: number; head_sha: string;
+    status: string; stage: string; instruction: string; context: Record<string, unknown> } | null;
 };
 export type RepoPreview = {
   analysis: { application_framework: string; native_test_framework: string; language: string; explanation: string };
@@ -31,6 +32,13 @@ export type RepoPreview = {
 export type Connections = {
   github: { connected: boolean; slug?: string; error: string };
   model: { connected: boolean; model: string; error: string };
+};
+export type InteractivePreviewData = {
+  defaults: { command: string; port: number; ready_path: string; setup_commands: string[] };
+  session: null | { id: string; status: string; command: string; port: number;
+    ready_path: string; url: string | null; error: string | null; created_at: string };
+  observations: { id: string; preview_id: string; verdict: string; steps: string;
+    expected: string; actual: string; created_at: string }[];
 };
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -64,4 +72,22 @@ export const api = {
   run: (id: string) => request<Run>(`/api/runs/${id}`),
   events: (id: string) => request<RunEvent[]>(`/api/runs/${id}/events`),
   flow: (id?: string) => request<FlowDefinition>(id ? `/api/runs/${id}/flow` : "/api/flow"),
+  interactivePreview: (id: string) => request<InteractivePreviewData>(`/api/runs/${id}/interactive-preview`),
+  startInteractivePreview: (id: string, input: { command: string; port: number; ready_path: string;
+    environment: Record<string, string>; setup_commands: string[] }) =>
+    request<NonNullable<InteractivePreviewData["session"]>>(`/api/runs/${id}/interactive-preview`, {
+      method: "POST", body: JSON.stringify(input),
+    }),
+  stopInteractivePreview: (id: string) => request<{ accepted: boolean }>(
+    `/api/runs/${id}/interactive-preview/stop`, { method: "POST" }),
+  interactivePreviewLogs: (id: string) => request<{ text: string; artifact: string | null }>(
+    `/api/runs/${id}/interactive-preview/logs`),
+  saveManualObservation: (id: string, input: { verdict: "passed" | "failed" | "blocked";
+    steps: string; expected: string; actual: string }) =>
+    request<{ observation_id: string; report: { queued: boolean; reason?: string } }>(
+      `/api/runs/${id}/interactive-preview/observations`, {
+        method: "POST", body: JSON.stringify(input),
+      }),
+  refreshManualReport: (id: string) => request<{ queued: boolean; reason?: string }>(
+    `/api/runs/${id}/interactive-preview/refresh-report`, { method: "POST" }),
 };

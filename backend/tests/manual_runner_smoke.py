@@ -24,6 +24,10 @@ async def main():
     source = run_dir(run_id) / "source"
     source.mkdir()
     (source / "README.md").write_text("Local runner smoke test\n", encoding="utf-8")
+    (source / "security_check.py").write_text(
+        "from pathlib import Path\nassert 'Local runner smoke test' in Path('README.md').read_text()\n",
+        encoding="utf-8",
+    )
     subprocess.run(["git", "init", "-q"], cwd=source, check=True)
     patch = (
         "diff --git a/tests/test_arithmetic.py b/tests/test_arithmetic.py\n"
@@ -38,7 +42,8 @@ async def main():
         "source_path": str(source), "selected_frameworks": [],
         "analysis": {"install_commands": [], "native_test_framework": "Python",
                      "has_native_test_framework": True,
-                     "app_start_command": "", "app_ready_url": ""},
+                     "app_start_command": "", "app_ready_url": "",
+                     "security_check_commands": ["python3 security_check.py"]},
     }
     result = await execute_tests(run_id, context, [{
         "agent": "builtin",
@@ -49,6 +54,7 @@ async def main():
                                        for event in get_events(run_id)]})
     if not result["success"]:
         raise SystemExit(1)
+    assert result["security_scans"][0]["success"] is True
     with session_scope() as session:
         session.execute(delete(RunEvent).where(RunEvent.run_id == run_id))
         session.execute(delete(Run).where(Run.id == run_id))

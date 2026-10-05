@@ -1,8 +1,8 @@
 # Ardberg PR testing
 
-Ardberg is a local Next.js and Python application for testing GitHub pull requests. A GitHub App fetches a pinned PR snapshot. Shared preflight identifies the repository and its test framework. LangGraph agents plan and generate tests in parallel, Temporal coordinates global fail-fast behavior, and a local container runner executes the generated patches. An agent writes an evidence-linked report for the dashboard and PR.
+Ardberg is a local Next.js and Python application for testing GitHub pull requests. A GitHub App fetches pinned base and PR snapshots, PR description, and commit messages. Shared preflight identifies the repository and its test framework, maps evidenced change impact, and compares checked-in OpenAPI contracts when available. LangGraph agents plan and generate tests in parallel, Temporal lets healthy branches finish after another branch fails, and a local container runner executes the generated patches. An agent writes an evidence-linked report for the dashboard and PR.
 
-The separate **Agent flow** tab is a read-only visual map inspired by n8n workflow canvases. It shows the saved testing instruction, shared context, live node states, suite fan-out, and report stages. Node states come from the backend event log. The overview lists recent manual and webhook runs.
+The separate **Agent flow** tab is a read-only visual map inspired by n8n workflow canvases. Each run URL loads its own diagram and event history, labelled with its PR, run ID, and commit. It shows the saved testing instruction, shared context, live node states, suite fan-out, optional human preview path, and report stages. The overview lists recent manual and webhook runs. The **Interactive preview** tab lets a reviewer start the pinned application in a disposable local container, open it in a browser, inspect logs, and record hands-on observations.
 
 ## Local setup
 
@@ -46,33 +46,47 @@ Prerequisites: Python 3.11+, Node.js 20+, Docker Desktop with Linux containers, 
    npm.cmd run dev
    ~~~
 
-6. Open http://127.0.0.1:3000. Enter a repository or PR URL, a detailed free-text instruction, and choose Playwright and/or Vitest only when the repository has no native test framework.
+6. Open http://127.0.0.1:3000. Enter a repository or PR URL. The free-text testing intent is optional: leave it blank to infer the changed feature from pinned PR evidence and run available checks. Choose Playwright and/or Vitest only when the repository has no native test framework.
 
 GitHub must be able to reach the webhook at /webhooks/github over public HTTPS. For local development, use an HTTPS tunnel that exposes only this webhook path. The dashboard and API are intended to stay on localhost. Set PUBLIC_DASHBOARD_URL only when the dashboard is reachable by PR reviewers.
 
 ## Behavior
 
-- The three agent definitions are Built-in Change, Playwright, and Vitest. Only enabled agents run. Existing native tests are handled by the Built-in Change Agent; when no native framework exists, the UI selection enables Playwright, Vitest, or both.
+- Built-in Change, Playwright, and Vitest agent graphs start in parallel after shared preflight. Each specialist checks its own applicability and stops with a recorded reason when its target cannot be tested; this does not stop the other branches. Existing native tests are handled by Built-in Change. When no native framework exists, the UI selection decides which specialist branches may generate tests.
+- The automated runner starts the repository application only when an applicable Playwright branch produces executable tests and an evidenced start command and readiness URL are available. Browser tests additionally require a browser target; a Playwright HTTP API adapter does not provide browser coverage. The Interactive preview can start the pinned application separately for hands-on review.
+- When testing intent is blank, preflight infers observable feature checks from the PR description, commits, diff, and source. The original field stays blank in the run record; the inferred goal and its source are shown in the run flow and overview. If expected behavior cannot be established, available repository checks still run and the report marks the feature unverified. Passing existing suites alone does not make the automatic review successful when no executable feature case was planned. A supplied intent still needs an observable expected result.
 - Each agent has its own system prompt and LangGraph node chain. A model chooses from an allowlisted skill catalog using PR context.
 - Generated tests are unified-diff artifacts and run first in a disposable checkout. After every suite passes, the GitHub App commits the validated test files to the exact PR head with a non-force update. A failed run keeps its patches as artifacts and still gets a report.
-- A failed node cancels active sibling agents or suites. Failure classification, evidence collection, and the report-writing agent still run.
+- A failed node stops its own agent branch. Other agents and runnable test suites finish and contribute evidence. A failed branch or suite still makes the overall automated verdict fail. A shared preflight or runner setup failure prevents work that depends on it.
+- A rejected test patch is kept as evidence; other accepted patches and their suites can still run. Generated tests are committed only when every enabled agent, patch, and suite succeeds.
+- The Interactive preview tab starts the pinned PR application on a Docker port published to `127.0.0.1` for up to two hours. The app start command, container port, ready path, disposable service setup commands, and application environment can be adjusted. Choose the repository's full application command when the feature needs an API or worker. The tab also shows a command for checking out the exact tested commit in an IDE. Reviewer observations include steps, expected behavior, actual behavior, and a verdict. Once automation is done, the report agent can incorporate these as labeled human evidence and update the GitHub check and PR comment.
 - The final report appears in the dashboard, a GitHub check, and an updated PR comment. The report is generated from real node events and test results.
 - Changed PR documents are included in the agent's evidence review and discussed in the website report, with truncation or missing evidence stated explicitly.
-- Preflight uses a pinned base/head comparison. Existing test frameworks are detected from repository files. Specialist branches run only when their evidence-backed targets are executable; an explicitly selected fallback without a valid adapter fails preflight.
+- The run overview shows an evidence-linked impact map: claimed feature, affected UI/API/database/security areas, related files, proposed checks, browser routes, and uncovered prerequisites. Commit messages and PR text are treated as hints and checked against source evidence.
+- The runner audits evidenced browser routes at 390, 768, and 1440 pixel widths, saves screenshots and overflow measurements, and flags loading errors or horizontal overflow. When a runnable base revision has no additional service fixture, it captures the same routes there and pairs screenshots. Byte differences are review evidence, not automatic layout defects.
+- Checked-in OpenAPI operations are compared between base and PR. Native and specialist agents can generate focused API regression cases for evidenced routes; unsupported auth or service fixtures remain uncovered.
+- When repository-declared security scan commands can be verified, the runner executes them and retains their logs. The Built-in agent also records source-backed potential concerns; it does not claim that an untested route is secure.
+- When a repository provides evidenced base setup, seed, and upgrade commands, a second disposable PostgreSQL database exercises a base-to-PR migration. Row counts, fingerprints of original columns, and upgraded schema are saved. Changed or removed seeded records require review; intentional transformations are not automatically called defects.
+- Preflight uses a pinned base/head comparison and detects existing test frameworks. All three agent graphs start after preflight; each specialist checks its evidence-backed target inside its own branch. A selected fallback without a valid adapter fails that branch while the others continue.
 - Test-only environment values must be present verbatim in repository context before they are passed to the disposable runner. Application secrets and GitHub credentials are never passed to it.
 - If repository evidence requires PostgreSQL, preflight declares a test service and its connection variable. The runner starts a disposable database on the private test network, supplies a generated test-only URL, and runs repository-derived schema setup commands before suites. It never uses Ardberg's own database.
-- New commits trigger webhook runs for PRs with a saved testing instruction. Open them from Recent runs in the overview.
+- New commits trigger webhook runs for PRs with saved test settings, including a deliberately blank testing intent. Blank intent is inferred again from the new pinned commit. Open runs from Recent runs in the overview.
 
 ## Configuration and limits
 
 - OPENAI_API_KEY and GitHub App credentials are required for a real run. The UI reports missing configuration; it does not substitute fake test results.
 - Repository source snippets, PR diff context, test plans, generated patches, and execution evidence are sent to the configured OpenAI model for analysis and report writing. The intake UI discloses this before PR analysis; use the app only with repositories authorized for that processing.
 - The runner image includes Node.js, Playwright browsers, and Python. Repository-specific dependencies are installed inside the disposable container. Other language runtimes need an added runner image.
-- The optional PostgreSQL test image is configured by POSTGRES_TEST_IMAGE; other external services need runner support before they can be used in a test run.
+- PREVIEW_MEMORY sets the interactive container memory cap independently of RUNNER_MEMORY. A heavy development server may need a larger value if the local Docker VM has enough memory; an OOM exit is shown with its saved application log.
+- The optional PostgreSQL test image is configured by POSTGRES_TEST_IMAGE. When repository migrations require the `vector` extension, Ardberg selects the pgvector image configured by POSTGRES_VECTOR_IMAGE. Other external services need runner support before they can be used in a test run. The interactive preview prevents overrides of its generated disposable database connection variables.
 - Dependency installation uses the configured npm and Python indexes. Test processes run on a private Docker network after installation; install scripts still execute while the package source is reachable.
-- The first version supports GitHub.com URLs. A selected specialist agent with no executable target or adapter fails the run.
-- The Temporal LangGraph integration is in Public Preview. Keep compatible dependency versions pinned during deployment and verify replay/cancellation in your environment.
+- The first version supports GitHub.com URLs. A user-selected fallback specialist with no executable target or adapter fails its branch while other branches continue. An automatically evaluated specialist with no executable target records a skipped branch.
+- The Temporal LangGraph integration is in Public Preview. Keep compatible dependency versions pinned during deployment and verify replay and branch completion in your environment.
+- Interactive previews run repository code with local browser access and retain network access for dependency installation and application use. Run them only for repositories you trust to execute on your machine. The preview container receives only repository-derived test environment values, never Ardberg credentials.
 - The local API has no multi-user authentication. Bind it to localhost and expose only the signed webhook path through a tunnel or reverse proxy.
+- The impact map is evidence-bound but cannot discover every dynamic dependency. The report must name unverified areas. Browser screenshots do not prove feature behavior; generated assertions and human preview observations remain separate.
+- OpenAPI comparison needs a checked-in OpenAPI or Swagger file. Baseline browser execution is skipped when it needs additional service fixtures. Seeded migration review runs only when the repository provides verifiable commands and fixtures; the runner never reads production data.
+- A security scan with no finding proves only that its selected checks found none. Repositories without a declared scanner receive a coverage gap, and static model concerns remain potential until tested.
 
 ## Verification commands
 
@@ -90,8 +104,12 @@ For local integration checks without GitHub or a model key, run the following fr
 .\.venv\Scripts\python.exe -m tests.manual_runner_smoke
 .\.venv\Scripts\python.exe -m tests.manual_failfast_smoke
 .\.venv\Scripts\python.exe -m tests.manual_suite_failfast_smoke
+.\.venv\Scripts\python.exe -m tests.manual_interactive_preview_smoke
+.\.venv\Scripts\python.exe -m tests.manual_interactive_temporal_smoke
+.\.venv\Scripts\python.exe -m tests.manual_report_refresh_smoke
 .\.venv\Scripts\python.exe -m tests.manual_no_native_vitest_smoke
 .\.venv\Scripts\python.exe -m tests.manual_playwright_adapter_smoke
+.\.venv\Scripts\python.exe -m tests.manual_visual_review_smoke
 .\.venv\Scripts\python.exe -m tests.manual_postgres_smoke
 ~~~
 
