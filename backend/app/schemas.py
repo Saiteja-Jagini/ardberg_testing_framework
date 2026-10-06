@@ -16,14 +16,12 @@ class CreateRunRequest(BaseModel):
     pr_number: int = Field(gt=0)
     instruction: str = Field(default="", max_length=12000)
     selected_frameworks: list[Literal["playwright", "vitest"]] = Field(default_factory=list)
+    mode: Literal["critique", "testing"] = "critique"
 
     @field_validator("instruction")
     @classmethod
     def meaningful_instruction(cls, value: str) -> str:
-        value = value.strip()
-        if value and (len(value) < 20 or len(value.split()) < 4):
-            raise ValueError("Describe the behavior and expected result in at least four words")
-        return value
+        return value.strip()
 
 
 class StartInteractivePreviewRequest(BaseModel):

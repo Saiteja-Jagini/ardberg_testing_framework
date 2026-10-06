@@ -27,7 +27,7 @@ from .interactive_preview import PreviewWorkflow, preview_defaults, preview_for_
 from .models import InteractivePreview, InteractivePreviewOptions, ManualObservation
 from .runner import _command
 from .schemas import ManualObservationRequest, StartInteractivePreviewRequest
-from .workflow import ManualReportWorkflow, RunWorkflow
+from .workflow import ManualReportWorkflow, ReviewWorkflow, RunWorkflow
 
 
 @asynccontextmanager
@@ -144,7 +144,8 @@ async def resolve(request: ResolveRequest):
 
 async def _start_run(repository: str, number: int, instruction: str,
                      selected_frameworks: list[str], installation_id: int,
-                     expected_head: str | None = None) -> str:
+                     expected_head: str | None = None,
+                     mode: str = "critique") -> str:
     github = GitHubApp()
     token = await github.installation_token(installation_id)
     pr = await github.pull_request(repository, number, token)
@@ -153,7 +154,8 @@ async def _start_run(repository: str, number: int, instruction: str,
     with session_scope() as session:
         run = Run(repository=repository, pr_number=number, installation_id=installation_id,
                   title=pr["title"], head_sha=pr["head"]["sha"], base_sha=pr["base"]["sha"],
-                  instruction=instruction, selected_frameworks=selected_frameworks)
+                  instruction=instruction, selected_frameworks=selected_frameworks,
+                  context={"mode": mode})
         session.add(run)
         session.flush()
         run_id = run.id
@@ -173,7 +175,7 @@ async def _start_run(repository: str, number: int, instruction: str,
         with session_scope() as session:
             session.get(Run, run_id).check_run_id = check_id
         client = await Client.connect(settings.temporal_address)
-        await client.start_workflow(RunWorkflow.run, run_id,
+        await client.start_workflow(ReviewWorkflow.run if mode == "critique" else RunWorkflow.run, run_id,
                                     id=f"ardberg-{run_id}", task_queue=settings.temporal_task_queue)
     except Exception as exc:
         if check_id is not None:
@@ -201,7 +203,8 @@ async def create_run(request: CreateRunRequest):
         record_installation(installation)
         installation_id = int(installation["id"])
         run_id = await _start_run(repository, request.pr_number, request.instruction,
-                                  request.selected_frameworks, installation_id)
+                                  request.selected_frameworks, installation_id,
+                                  mode=request.mode)
         return {"run_id": run_id}
     except (ValueError, GitHubError) as exc:
         raise HTTPException(422, str(exc)) from exc

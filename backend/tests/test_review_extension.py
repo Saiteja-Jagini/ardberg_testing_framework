@@ -334,9 +334,8 @@ def test_blank_intent_can_report_unclear_feature_without_inventing_assertions(mo
     assert CreateRunRequest.model_validate({"repository": "owner/repo", "pr_number": 1}).instruction == ""
     assert CreateRunRequest.model_validate({"repository": "owner/repo", "pr_number": 1,
                                             "instruction": "   "}).instruction == ""
-    with pytest.raises(ValueError):
-        CreateRunRequest.model_validate({"repository": "owner/repo", "pr_number": 1,
-                                         "instruction": "Test this PR"})
+    assert CreateRunRequest.model_validate({"repository": "owner/repo", "pr_number": 1,
+                                            "instruction": "Review missing behavior"}).instruction == "Review missing behavior"
 
     async def fake_parse(_prompt, _payload, _schema):
         return InstructionAssessment(testable=False, reason="No expected result in PR evidence",
@@ -375,7 +374,7 @@ def test_api_and_webhook_accept_saved_blank_testing_intent(monkeypatch):
             return {"id": 17}
 
     async def fake_start(repo, number, instruction, selected, installation,
-                         expected_head=None):
+                         expected_head=None, mode="critique"):
         captured.append((repo, number, instruction, selected, installation, expected_head))
         return str(uuid4())
 

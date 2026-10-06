@@ -208,7 +208,7 @@ class GitHubApp:
     async def complete_check(self, repository: str, check_id: int, token: str,
                              conclusion: str, summary: str, details_url: str | None = None):
         body = {"status": "completed", "conclusion": conclusion,
-                "output": {"title": "Ardberg PR test review", "summary": summary[:65000]}}
+                "output": {"title": "Ardberg PR review", "summary": summary[:65000]}}
         if details_url:
             body["details_url"] = details_url
         await self._request("PATCH", f"/repos/{repository}/check-runs/{check_id}",

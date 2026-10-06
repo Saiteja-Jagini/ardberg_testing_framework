@@ -6,9 +6,84 @@ AGENT_LABELS = {"builtin": "Built-in Change Agent", "playwright": "Playwright Ag
 AGENT_STEPS = STAGE_NAMES
 
 
+def review_definition(run: dict | None, events: list[dict]) -> dict:
+    """The critique workflow shown for new and review-mode runs."""
+    latest = {}
+    for event in events:
+        if event["node"] and event["status"] != "artifact":
+            key = f"{event['agent']}.{event['node']}" if event["agent"] else f"preflight.{event['node']}"
+            latest[key] = event
+    nodes = []
+    edges = []
+    def add(node_id: str, label: str, x: int, y: int, group: str, description: str):
+        event = latest.get(node_id)
+        nodes.append({"id": node_id, "label": label, "x": x, "y": y,
+                      "group": group, "description": description,
+                      "status": event["status"] if event else "not_started", "event": event})
+    def link(source: str, target: str, label: str = ""):
+        edges.append({"id": f"{source}->{target}", "source": source,
+                      "target": target, "label": label})
+    add("input", "PR + review intent", 0, 250, "input",
+        "The PR link and optional review intent define the critique.")
+    if run:
+        nodes[-1]["status"] = "passed"
+    previous = "input"
+    preflight = [
+        ("fetch_repository", "Pin diff and source", "Fetch the exact base and PR revisions."),
+        ("validate_instruction", "Interpret intent", "Keep supplied intent or infer expectations from PR evidence."),
+        ("analyze_framework", "Discover runtime", "Find application, install, start, and service commands."),
+        ("map_impact", "Map change impact", "Trace changed code and related surfaces."),
+        ("compare_api_contract", "Compare API contract", "Compare checked-in contracts where available."),
+    ]
+    for index, (name, label, description) in enumerate(preflight):
+        node_id = f"preflight.{name}"
+        add(node_id, label, (index + 1) * 280, 250, "preflight", description)
+        link(previous, node_id)
+        previous = node_id
+    stages = [
+        ("behavior.analyze", "Behavior agent", "Extract expected behavior and ambiguity from intent and PR evidence.", "review"),
+        ("code_critic.analyze", "Code critic", "Trace changed implementation and identify evidence-backed concerns.", "review"),
+        ("runtime_planner.analyze", "Runtime planner", "Plan focused browser, HTTP, or script probes.", "review"),
+        ("runner.base_setup", "Base runtime", "Run comparable probes on the pinned base when useful.", "executor"),
+        ("runner.head_setup", "PR runtime", "Run the changed code in a disposable container.", "executor"),
+        ("evidence_critic.classify", "Evidence critic", "Separate confirmed findings from potential and unverified concerns.", "review"),
+        ("report.classify_failures", "Classify blockers", "Read setup and runtime failure evidence.", "investigation"),
+        ("report.write_analysis", "Write critique", "Report missing behavior, impact, reproduction, and limits.", "report"),
+        ("report.verify_evidence", "Verify claims", "Reject unsupported report claims.", "report"),
+        ("report.publish", "Publish report", "Save to dashboard, GitHub check, and PR comment.", "report"),
+    ]
+    for index, (node_id, label, description, group) in enumerate(stages):
+        add(node_id, label, 1680 + index * 300, 250, group, description)
+        if (run and run["status"] in {"completed", "failed"} and
+                node_id in {"runner.base_setup", "runner.head_setup"} and
+                nodes[-1]["event"] is None):
+            nodes[-1]["status"] = "not_selected"
+        link(previous, node_id)
+        previous = node_id
+    probe_events = [event for event in events if event["stage"] == "runtime"
+                    and event["agent"] == "runner" and event["node"]
+                    and event["node"] not in {"head_setup", "base_setup"}
+                    and not event["node"].startswith(("head_install_", "base_install_",
+                                                       "head_service_", "base_service_"))]
+    for index, name in enumerate(dict.fromkeys(event["node"] for event in probe_events)):
+        node_id = f"runner.{name}"
+        add(node_id, f"Probe {name}", 2850, 570 + index * 135, "runtime",
+            "Focused observation of changed behavior; see its event and saved artifacts.")
+        link("runner.head_setup", node_id, "execute")
+        link(node_id, "evidence_critic.classify", "observation")
+    return {"nodes": nodes, "edges": edges,
+            "run": {"id": run["id"], "repository": run["repository"],
+                    "pr_number": run["pr_number"], "head_sha": run["head_sha"],
+                    "status": run["status"], "stage": run["stage"],
+                    "instruction": (run["context"] or {}).get("instruction", run["instruction"]),
+                    "context": run["context"]} if run else None}
+
+
 def definition(run_id: str | None = None) -> dict:
     run = get_run(run_id) if run_id else None
     events = get_events(run_id) if run_id else []
+    if run is None or (run.get("context") or {}).get("mode") == "critique":
+        return review_definition(run, events)
     enabled_agents = set(run["context"].get("enabled_agents", [])) if run and run["context"] else None
     latest = {}
     for event in events:

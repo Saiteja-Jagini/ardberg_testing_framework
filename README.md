@@ -1,8 +1,8 @@
-# Ardberg PR testing
+# Ardberg PR critique
 
-Ardberg is a local Next.js and Python application for testing GitHub pull requests. A GitHub App fetches pinned base and PR snapshots, PR description, and commit messages. Shared preflight identifies the repository and its test framework, maps evidenced change impact, and compares checked-in OpenAPI contracts when available. LangGraph agents plan and generate tests in parallel, Temporal lets healthy branches finish after another branch fails, and a local container runner executes the generated patches. An agent writes an evidence-linked report for the dashboard and PR.
+Ardberg is a local Next.js and Python application for reviewing GitHub pull requests. A GitHub App fetches pinned base and PR snapshots, PR description, and commit messages. Shared preflight maps change impact and discovers how the changed code can run. A behavior agent extracts expected behavior, a code critic records a code status and caller trace for every behavior, and a runtime planner selects focused browser, HTTP, or script probes. A disposable container runs the changed code and compares the base revision when useful. An evidence critic separates confirmed findings from potential or unverified concerns. The final critique is saved to the dashboard and published to the PR. The prior generated-test workflow is available only when explicitly selected; dashboard and webhook runs default to critique.
 
-The separate **Agent flow** tab is a read-only visual map inspired by n8n workflow canvases. Each run URL loads its own diagram and event history, labelled with its PR, run ID, and commit. It shows the saved testing instruction, shared context, live node states, suite fan-out, optional human preview path, and report stages. The overview lists recent manual and webhook runs. The **Interactive preview** tab lets a reviewer start the pinned application in a disposable local container, open it in a browser, inspect logs, and record hands-on observations.
+The separate **Agent flow** tab is a read-only visual map inspired by n8n workflow canvases. Each run URL loads its own diagram and event history, labelled with its PR, run ID, and commit. New runs show expected-behavior extraction, code critique, runtime planning, disposable execution, evidence classification, and report stages. The overview lists recent manual and webhook runs. The **Interactive preview** tab lets a reviewer start the pinned application in a disposable local container, open it in a browser, inspect logs, and record hands-on observations.
 
 ## Local setup
 
@@ -48,13 +48,20 @@ Prerequisites: Python 3.11+, Node.js 20+, Docker Desktop with Linux containers, 
 
    The frontend uses the shadcn/ui `radix-nova` preset from [shadcn/create](https://ui.shadcn.com/create). Its generated components are in `frontend/src/components/ui`, and theme tokens are in `frontend/src/app/globals.css`.
 
-6. Open http://127.0.0.1:3000. Enter a repository or PR URL. The free-text testing intent is optional: leave it blank to infer the changed feature from pinned PR evidence and run available checks. Choose Playwright and/or Vitest only when the repository has no native test framework.
+6. Open http://127.0.0.1:3000. Enter a repository or PR URL. The optional review intent should describe what the change is expected to do. When blank, Ardberg tries to infer expectations from pinned PR evidence and labels any unresolved behavior as unverified.
 
    The API accepts the configured frontend port from both `localhost` and `127.0.0.1`. If Next.js uses another port or hostname, set `FRONTEND_ORIGIN` in `.env` to that browser address and restart the API.
 
 GitHub must be able to reach the webhook at /webhooks/github over public HTTPS. For local development, use an HTTPS tunnel that exposes only this webhook path. The dashboard and API are intended to stay on localhost. Set PUBLIC_DASHBOARD_URL only when the dashboard is reachable by PR reviewers.
 
-## Behavior
+## Current review flow
+
+- The behavior agent extracts expectations from user intent, PR evidence, and relevant documentation. The code critic traces the changed implementation and candidate callers, quotes supporting source, and records implemented, incomplete, contradictory, or unknown for each expectation. The runtime planner chooses at most 12 focused scenarios. These stages preserve ambiguity when the expected result cannot be established.
+- The runner installs the pinned code in a disposable container and executes focused browser, local HTTP, or script probes. Browser and HTTP probes require an evidenced start command and readiness URL; library and CLI code can be invoked by a temporary script. Comparable probes may run against a separate pinned base checkout. Generated probe scripts stay in local artifacts and are not committed to the PR.
+- The evidence critic marks a behavior confirmed missing only when a PR runtime observation visibly contradicts an evidenced expectation. It marks a regression only with a comparable base observation. Setup failures, unavailable fixtures, and incomplete source remain unverified. The report leads with the critique, impact, reproduction, and limits. A completed run means the review finished; the GitHub check can still fail for confirmed findings or be neutral when review evidence is incomplete.
+- Existing test-suite execution and generated-test commits are not part of default critique runs. The dashboard's optional legacy testing choice, or `mode: "testing"` on `POST /api/runs`, starts the generated-test workflow instead. The Interactive preview remains available for a reviewer to inspect the pinned application and add separately attributed human observations.
+
+## Legacy testing workflow
 
 - Built-in Change, Playwright, and Vitest agent graphs start in parallel after shared preflight. Each specialist checks its own applicability and stops with a recorded reason when its target cannot be tested; this does not stop the other branches. Existing native tests are handled by Built-in Change. When no native framework exists, the UI selection decides which specialist branches may generate tests.
 - The automated runner starts the repository application only when an applicable Playwright branch produces executable tests and an evidenced start command and readiness URL are available. Browser tests additionally require a browser target; a Playwright HTTP API adapter does not provide browser coverage. The Interactive preview can start the pinned application separately for hands-on review.

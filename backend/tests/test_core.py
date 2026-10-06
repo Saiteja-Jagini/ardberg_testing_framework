@@ -744,7 +744,9 @@ def test_api_health_and_reference_flow():
         assert client.get("/health").status_code == 200
         result = client.get("/api/flow")
         assert result.status_code == 200
-        assert len(result.json()["nodes"]) > 20
+        nodes = {item["id"] for item in result.json()["nodes"]}
+        assert {"behavior.analyze", "code_critic.analyze", "runtime_planner.analyze",
+                "runner.head_setup", "evidence_critic.classify", "report.publish"} <= nodes
         assert client.get("/api/runs").status_code == 200
 
 

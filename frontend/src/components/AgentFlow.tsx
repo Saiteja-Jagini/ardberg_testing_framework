@@ -79,7 +79,9 @@ export default function AgentFlow({ flow, instruction }: { flow: FlowDefinition;
           <MiniMap pannable zoomable nodeStrokeWidth={2} maskColor="color-mix(in oklch, var(--foreground) 7%, transparent)" />
         </ReactFlow>
       </div>
-      <div className="flow-note">Built-in, Playwright, and Vitest start in parallel, with ordered nodes inside each branch. A specialist without an executable target stops at applicability; other branches continue. Browser tests start the app only when the Playwright browser branch produces runnable tests. The preview is an optional human testing path.</div>
+      <div className="flow-note">{!flow.run || flow.run.context?.mode === "critique"
+        ? "The behavior agent extracts expectations, the code critic traces possible gaps, and the runtime planner selects focused scenarios. The runner observes pinned PR behavior in a disposable container and compares the base when useful. The evidence critic classifies findings before the report is published."
+        : "Built-in, Playwright, and Vitest start in parallel, with ordered nodes inside each branch. A specialist without an executable target stops at applicability; other branches continue. Browser tests start the app only when the Playwright browser branch produces runnable tests. The preview is an optional human testing path."}</div>
     </Card>
     <aside className="flow-inspector"><ScrollArea className="h-full pr-3">
       <div className="eyebrow">NODE INSPECTOR</div>
@@ -88,7 +90,7 @@ export default function AgentFlow({ flow, instruction }: { flow: FlowDefinition;
       <div className="inspector-status"><Badge variant="outline" className={["status-badge", selectedNode?.status ?? "not_started"].join(" ")}>{selectedNode?.status.replaceAll("_", " ")}</Badge><Badge variant="secondary">{selectedNode?.group}</Badge></div>
       <Separator className="my-5" />
       <div className="eyebrow">{flow.run?.context?.instruction_source === "inferred" ? "INFERRED PR REVIEW GOAL" : flow.run?.context?.instruction_source === "automatic_fallback" ? "AUTOMATIC REVIEW GOAL · FEATURE INTENT UNCLEAR" : "INSTRUCTION PASSED TO AGENTS"}</div>
-      <div className="instruction-card">{flow.run?.instruction || instruction || "Leave the testing intent blank to derive a review goal from the PR, or enter a specific behavior and expected result."}</div>
+      <div className="instruction-card">{flow.run?.instruction || instruction || "Leave review intent blank to infer expected behavior from the PR, or describe what the change should do."}</div>
       {selectedNode?.event && <><Separator className="my-5" /><div className="eyebrow">LATEST NODE EVENT</div><div className="event-meta">Event #{selectedNode.event.id} · {new Date(selectedNode.event.created_at).toLocaleString()}</div><div className="event-meta">Boolean result: {selectedNode.event.success === null ? "pending" : String(selectedNode.event.success)}</div><ScrollArea className="max-h-72 rounded-md border"><pre className="event-json">{JSON.stringify(selectedNode.event.detail, null, 2)}</pre></ScrollArea></>}
       {analysis && <><Separator className="my-5" /><div className="eyebrow">SHARED CONTEXT</div><p className="context-summary">{String(analysis.application_framework ?? "Framework unknown")} · {String(analysis.native_test_framework ?? "Tests unknown")}</p><span className="muted-small">Pinned commit {String(flow.run?.context?.head_sha ?? "").slice(0, 12)}</span></>}
       {Boolean(flow.run?.context?.impact_map) && <><Separator className="my-5" /><div className="eyebrow">IMPACT MAP FOR THIS RUN</div><p className="context-summary">{String((flow.run?.context.impact_map as { feature_summary?: string }).feature_summary ?? "Impact not established")}</p></>}

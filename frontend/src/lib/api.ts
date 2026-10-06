@@ -66,7 +66,7 @@ export const api = {
   preview: (repository: string, pr_number: number) => request<RepoPreview>("/api/preview", {
     method: "POST", body: JSON.stringify({ repository, pr_number }),
   }),
-  createRun: (input: { repository: string; pr_number: number; instruction: string; selected_frameworks: string[] }) =>
+  createRun: (input: { repository: string; pr_number: number; instruction: string; selected_frameworks: string[]; mode?: "critique" | "testing" }) =>
     request<{ run_id: string }>("/api/runs", { method: "POST", body: JSON.stringify(input) }),
   runs: () => request<RunSummary[]>("/api/runs"),
   run: (id: string) => request<Run>(`/api/runs/${id}`),

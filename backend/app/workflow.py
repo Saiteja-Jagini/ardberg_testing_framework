@@ -12,6 +12,7 @@ with workflow.unsafe.imports_passed_through():
     from .inspection import prepare_run
     from .publication import publish_generated_tests
     from .report import generate_report, publish_report
+    from .review import run_review
     from .runner import execute_tests
 
 
@@ -67,7 +68,7 @@ async def report_activity(run_id: str, outcome: dict) -> str:
 
 
 @activity.defn
-async def publish_activity(run_id: str, markdown: str, success: bool) -> None:
+async def publish_activity(run_id: str, markdown: str, success: bool | str) -> None:
     try:
         await publish_report(run_id, markdown, success)
     except Exception as exc:
@@ -80,6 +81,64 @@ async def publish_activity(run_id: str, markdown: str, success: bool) -> None:
 async def status_activity(run_id: str, status: str, stage: str, error: str = "") -> None:
     set_run(run_id, status=status, stage=stage, error=error or None)
     emit(run_id, stage, status, detail={"error": error} if error else {})
+
+
+@activity.defn
+async def review_activity(run_id: str, context: dict) -> dict:
+    set_run(run_id, stage="review")
+    outcome = await run_review(run_id, context)
+    set_run(run_id, context={**context, "review_verdict": outcome["verdict"]})
+    return outcome
+
+
+@workflow.defn
+class ReviewWorkflow:
+    """Critique the changed behavior without generating or committing test patches."""
+
+    @workflow.run
+    async def run(self, run_id: str) -> dict:
+        outcome = {"mode": "critique", "success": False, "stage": "preflight",
+                   "error": "Review did not start"}
+        try:
+            context = await workflow.execute_activity(
+                preflight_activity, run_id, start_to_close_timeout=timedelta(minutes=10),
+                retry_policy=NO_RETRY,
+            )
+            if context.get("_failed"):
+                outcome["error"] = context["_failed"]
+            else:
+                outcome = await workflow.execute_activity(
+                    review_activity, args=[run_id, context],
+                    start_to_close_timeout=timedelta(hours=2), retry_policy=NO_RETRY,
+                )
+        except Exception as exc:
+            outcome = {"mode": "critique", "success": False, "stage": "review",
+                       "error": str(exc)}
+        await workflow.execute_activity(
+            status_activity, args=[run_id, "reporting", "report", outcome.get("error", "")],
+            start_to_close_timeout=timedelta(seconds=30), retry_policy=NO_RETRY,
+        )
+        try:
+            markdown = await workflow.execute_activity(
+                report_activity, args=[run_id, outcome],
+                start_to_close_timeout=timedelta(minutes=10), retry_policy=NO_RETRY,
+            )
+            conclusion = outcome.get("check_conclusion", "failure") if outcome["success"] else "failure"
+            await workflow.execute_activity(
+                publish_activity, args=[run_id, markdown, conclusion],
+                start_to_close_timeout=timedelta(minutes=2), retry_policy=NO_RETRY,
+            )
+            await workflow.execute_activity(
+                status_activity, args=[run_id, "completed" if outcome["success"] else "failed",
+                                       "done", outcome.get("error", "")],
+                start_to_close_timeout=timedelta(seconds=30), retry_policy=NO_RETRY,
+            )
+        except Exception as exc:
+            await workflow.execute_activity(
+                status_activity, args=[run_id, "failed", "report", f"Report/publish failed: {exc}"],
+                start_to_close_timeout=timedelta(seconds=30), retry_policy=NO_RETRY,
+            )
+        return outcome
 
 
 @workflow.defn
@@ -203,8 +262,11 @@ class ManualReportWorkflow:
                 report_activity, args=[run_id, outcome],
                 start_to_close_timeout=timedelta(minutes=10), retry_policy=NO_RETRY,
             )
+            conclusion = outcome["success"]
+            if outcome.get("mode") == "critique":
+                conclusion = outcome.get("check_conclusion", "neutral") if outcome["success"] else "failure"
             await workflow.execute_activity(
-                publish_activity, args=[run_id, markdown, outcome["success"]],
+                publish_activity, args=[run_id, markdown, conclusion],
                 start_to_close_timeout=timedelta(minutes=2), retry_policy=NO_RETRY,
             )
             await workflow.execute_activity(
