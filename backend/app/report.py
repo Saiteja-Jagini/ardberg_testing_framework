@@ -133,7 +133,9 @@ def _check_claim_links(run_id: str, draft: ReportDraft, events: list[dict],
 def evidence_counts(events: list[dict], outcome: dict) -> dict:
     suite_nodes = {item["node"] for item in events
                    if item["stage"] == "execution" and item["agent"] == "executor"
-                   and item["status"] == "running" and item["node"] != "setup"
+                   and item["status"] == "running"
+                   and bool(re.fullmatch(r"(?:builtin|playwright|vitest)-\d+|visual-review",
+                                         item["node"] or ""))
                    and isinstance((item.get("detail") or {}).get("command"), str)}
     suites = [item for item in events if item["stage"] == "execution"
               and item["agent"] == "executor" and item["node"] in suite_nodes]
@@ -177,7 +179,10 @@ def classify_failure(events: list[dict]) -> list[dict]:
             category = "generated_test_or_agent"
         elif stage == "publication":
             category = "generated_test_publication_failure"
-        elif event["node"] in {"setup", "start_runner", "apply_patches"}:
+        elif (event["node"] in {"setup", "start_runner", "apply_patches"} or
+              (event["node"] or "").startswith(("install-", "service-setup-",
+                                                  "baseline-install-", "database-baseline-install-")) or
+              event["node"] in {"baseline-browser-dependency", "browser-audit-dependency"}):
             category = "environment_or_patch"
         elif detail.get("exit_code") is not None:
             structured = detail.get("structured_result") or {}

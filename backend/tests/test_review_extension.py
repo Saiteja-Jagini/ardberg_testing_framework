@@ -19,7 +19,7 @@ from app.github import GitHubApp
 from app.impact import build_impact_map, validate_impact_map
 from app.inspection import _declared_security_command, _security_scan_command, prepare_run, resolve_review_intent
 from app.models import PullRequestSettings, Run
-from app.report import evidence_counts
+from app.report import classify_failure, evidence_counts
 from app.runner import _compare_visual_artifacts
 from app.schemas import (CreateRunRequest, FrameworkAnalysis, GeneratedPatch, ImpactArea, ImpactCheck, ImpactMap, InstructionAssessment,
                          SecurityConcern, SecurityReview, SpecialistDecision)
@@ -180,6 +180,10 @@ def test_github_commit_intake_reports_pagination(monkeypatch):
 
 def test_review_nodes_do_not_count_as_test_suites():
     events = [
+        {"stage": "execution", "agent": "executor", "node": "install-1",
+         "status": "running", "detail": {"command": "pip install -e ."}},
+        {"stage": "execution", "agent": "executor", "node": "install-1",
+         "status": "failed", "detail": {"error": "Missing package"}},
         {"stage": "execution", "agent": "executor", "node": "database_snapshot",
          "status": "passed", "detail": {}},
         {"stage": "execution", "agent": "executor", "node": "baseline_visual",
@@ -193,6 +197,8 @@ def test_review_nodes_do_not_count_as_test_suites():
     assert counts["suites_started"] == 1
     assert counts["suites_failed"] == 1
     assert counts["suites_passed"] == 0
+    failed_install = dict(events[1], id=42, run_id="local-test")
+    assert classify_failure([failed_install])[0]["category"] == "environment_or_patch"
 
 
 def test_security_commands_need_repository_declaration():

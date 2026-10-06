@@ -125,6 +125,12 @@ class CommandSelection(BaseModel):
     rationale: str
 
 
+class DependencyRepair(BaseModel):
+    missing_dependency: bool
+    repair_command: str = ""
+    reason: str
+
+
 class TestEnvironmentValue(BaseModel):
     key: str
     value: str

@@ -46,6 +46,8 @@ Prerequisites: Python 3.11+, Node.js 20+, Docker Desktop with Linux containers, 
    npm.cmd run dev
    ~~~
 
+   The frontend uses the shadcn/ui `radix-nova` preset from [shadcn/create](https://ui.shadcn.com/create). Its generated components are in `frontend/src/components/ui`, and theme tokens are in `frontend/src/app/globals.css`.
+
 6. Open http://127.0.0.1:3000. Enter a repository or PR URL. The free-text testing intent is optional: leave it blank to infer the changed feature from pinned PR evidence and run available checks. Choose Playwright and/or Vitest only when the repository has no native test framework.
 
    The API accepts the configured frontend port from both `localhost` and `127.0.0.1`. If Next.js uses another port or hostname, set `FRONTEND_ORIGIN` in `.env` to that browser address and restart the API.
@@ -82,6 +84,7 @@ GitHub must be able to reach the webhook at /webhooks/github over public HTTPS. 
 - PREVIEW_MEMORY sets the interactive container memory cap independently of RUNNER_MEMORY. A heavy development server may need a larger value if the local Docker VM has enough memory; an OOM exit is shown with its saved application log.
 - The optional PostgreSQL test image is configured by POSTGRES_TEST_IMAGE. When repository migrations require the `vector` extension, Ardberg selects the pgvector image configured by POSTGRES_VECTOR_IMAGE. Other external services need runner support before they can be used in a test run. The interactive preview prevents overrides of its generated disposable database connection variables.
 - Dependency installation uses the configured npm and Python indexes. Test processes run on a private Docker network after installation; install scripts still execute while the package source is reachable.
+- When an install or service setup command reports a missing prerequisite, the runner asks the repair agent for one safe installation command, runs it inside the disposable container, and retries the failed command. `SETUP_REPAIR_LIMIT` caps repairs per setup node at 2 by default (maximum 5). Attempt and repair logs are retained; an unresolved prerequisite fails that node. The same behavior applies to automated runs, baseline browser setup, database baseline installation, and interactive previews. For service setup after network isolation, network access is restored only during the repair command.
 - The first version supports GitHub.com URLs. A user-selected fallback specialist with no executable target or adapter fails its branch while other branches continue. An automatically evaluated specialist with no executable target records a skipped branch.
 - The Temporal LangGraph integration is in Public Preview. Keep compatible dependency versions pinned during deployment and verify replay and branch completion in your environment.
 - Interactive previews run repository code with local browser access and retain network access for dependency installation and application use. Run them only for repositories you trust to execute on your machine. The preview container receives only repository-derived test environment values, never Ardberg credentials.

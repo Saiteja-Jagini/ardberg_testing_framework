@@ -22,7 +22,8 @@ with workflow.unsafe.imports_passed_through():
     from .db import session_scope
     from .events import emit, get_run
     from .models import InteractivePreview, InteractivePreviewOptions, ManualObservation
-    from .runner import _command, _environment_args, _postgres_image, _start_postgres, _test_environment
+    from .runner import (_command, _environment_args, _postgres_image,
+                         _run_setup_with_repair, _start_postgres, _test_environment)
 
 
 PREVIEW_LIFETIME = timedelta(hours=2)
@@ -105,7 +106,8 @@ async def launch_preview(preview_id: str) -> dict:
         extra_environment = dict(options.environment) if options else {}
         custom_setup = list(options.setup_commands) if options and options.setup_commands is not None else None
     run_id = record["run_id"]
-    source = Path(get_run(run_id)["context"]["source_path"]).resolve()
+    context = get_run(run_id)["context"]
+    source = Path(context["source_path"]).resolve()
     if not source.is_dir():
         raise RuntimeError("The pinned PR source snapshot is missing")
     root = run_dir(run_id).resolve()
@@ -142,16 +144,16 @@ async def launch_preview(preview_id: str) -> dict:
                                       f"{container}:/workspace", timeout=180)
         if code:
             raise RuntimeError(f"Could not copy pinned PR source: {output}")
-        analysis = get_run(run_id)["context"]["analysis"]
+        analysis = context["analysis"]
         for index, command in enumerate(analysis.get("install_commands", [])):
-            code, output = await _command(
-                "docker", "exec", "-e", f"NPM_CONFIG_REGISTRY={settings.npm_registry_url}",
-                "-e", f"PIP_INDEX_URL={settings.pip_index_url}", container,
-                "sh", "-lc", command, timeout=settings.test_timeout_seconds,
+            await _run_setup_with_repair(
+                run_id, stage="manual", agent="preview", node=f"install-{index + 1}",
+                container=container, command=command,
+                log_prefix=f"manual/{preview_id}/install-{index + 1}", workspace=workspace,
+                environment={"NPM_CONFIG_REGISTRY": settings.npm_registry_url,
+                             "PIP_INDEX_URL": settings.pip_index_url},
+                instruction=context.get("instruction", ""),
             )
-            path = write_artifact(run_id, f"manual/{preview_id}/install-{index + 1}.log", output)
-            if code:
-                raise RuntimeError(f"Preview install failed (exit {code}); see {path}")
         postgres_password = None
         services = analysis.get("services") or []
         if services:
@@ -167,12 +169,15 @@ async def launch_preview(preview_id: str) -> dict:
         setup_commands = custom_setup if custom_setup is not None else preview_defaults(
             {"analysis": analysis})["setup_commands"]
         for index, command in enumerate(setup_commands):
-            code, output = await _command("docker", "exec", *_environment_args(environment),
-                                          container, "sh", "-lc", command,
-                                          timeout=settings.test_timeout_seconds)
-            path = write_artifact(run_id, f"manual/{preview_id}/service-{index + 1}.log", output)
-            if code:
-                raise RuntimeError(f"Preview service setup failed (exit {code}); see {path}")
+            await _run_setup_with_repair(
+                run_id, stage="manual", agent="preview", node=f"service-{index + 1}",
+                container=container, command=command,
+                log_prefix=f"manual/{preview_id}/service-{index + 1}", workspace=workspace,
+                environment={**environment,
+                             "NPM_CONFIG_REGISTRY": settings.npm_registry_url,
+                             "PIP_INDEX_URL": settings.pip_index_url},
+                instruction=context.get("instruction", ""),
+            )
         code, output = await _command(
             "docker", "exec", "-d", *_environment_args(environment), container,
             "sh", "-lc", f"({record['command']}) > /tmp/ardberg-preview.log 2>&1; "

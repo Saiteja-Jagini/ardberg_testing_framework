@@ -3,7 +3,21 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import ReactMarkdown from "react-markdown";
-import { Activity, ArrowRight, Check, ChevronRight, CircleHelp, ExternalLink, GitBranch, GitPullRequest, LayoutDashboard, LoaderCircle, Play, Plus, RefreshCw, ShieldCheck, Workflow, X } from "lucide-react";
+import { Activity, ArrowRight, Bot, Check, CircleCheck, CircleHelp, CircleX, ExternalLink, GitBranch, GitPullRequest, Github, LayoutDashboard, LoaderCircle, Play, Plus, RefreshCw, Workflow, X } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
+import { Label } from "@/components/ui/label";
+import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
+import { ScrollArea } from "@/components/ui/scroll-area";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { Separator } from "@/components/ui/separator";
+import { Breadcrumb, BreadcrumbItem, BreadcrumbList, BreadcrumbPage, BreadcrumbSeparator } from "@/components/ui/breadcrumb";
+import { Sidebar, SidebarContent, SidebarFooter, SidebarGroup, SidebarGroupContent, SidebarGroupLabel, SidebarHeader, SidebarInset, SidebarMenu, SidebarMenuButton, SidebarMenuItem, SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar";
+import { Alert, AlertDescription } from "@/components/ui/alert";
+import { Checkbox } from "@/components/ui/checkbox";
+import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import AgentFlow from "./AgentFlow";
 import InteractivePreview from "./InteractivePreview";
 import ReviewScope from "./ReviewScope";
@@ -28,6 +42,18 @@ function latestFor(events: RunEvent[], agent: string) {
   return [...events].reverse().find(event => event.agent === agent && event.node && event.status !== "artifact");
 }
 
+function ConnectionBadge({ label, connected, checked, error, icon }: {
+  label: string; connected: boolean; checked: boolean; error?: string; icon: React.ReactNode;
+}) {
+  const state = checked ? (connected ? "connected" : "disconnected") : "checking";
+  return <Badge variant={!checked ? "outline" : connected ? "secondary" : "destructive"}
+    className="connection-badge h-8 gap-2 px-2.5" title={error || `${label} ${state}`}
+    aria-label={`${label} ${state}`}>
+    {icon}<span className="connection-label">{label} {state}</span>
+    {!checked ? <LoaderCircle className="spin" /> : connected ? <CircleCheck /> : <CircleX />}
+  </Badge>;
+}
+
 export default function Dashboard({ initialRunId }: { initialRunId?: string }) {
   const router = useRouter();
   const [tab, setTab] = useState<"workspace" | "flow" | "interactive">("workspace");
@@ -49,7 +75,6 @@ export default function Dashboard({ initialRunId }: { initialRunId?: string }) {
   const [installUrl, setInstallUrl] = useState("");
 
   const activeRunId = useRef(initialRunId);
-  activeRunId.current = initialRunId;
   const refresh = useCallback(async () => {
     if (!initialRunId) return;
     const [nextRun, nextEvents, nextFlow] = await Promise.all([
@@ -62,9 +87,12 @@ export default function Dashboard({ initialRunId }: { initialRunId?: string }) {
 
   useEffect(() => {
     let active = true;
-    setRun(null); setEvents([]); setFlow(null);
+    activeRunId.current = initialRunId;
+    const reset = window.setTimeout(() => {
+      if (!active) return;
+      setRun(null); setEvents([]); setFlow(null); setTab("workspace");
+    }, 0);
     eventCursor.current = 0;
-    setTab("workspace");
     api.health().then(setHealth).catch(() => setHealth(null));
     api.connections().then(setConnections).catch(() => setConnections({
       github: { connected: false, error: "Cannot reach the backend connection check" },
@@ -77,7 +105,7 @@ export default function Dashboard({ initialRunId }: { initialRunId?: string }) {
         eventCursor.current = Math.max(eventCursor.current, ...nextEvents.map(event => event.id), 0);
       }).catch(err => { if (active) setError(err.message); });
     else api.flow().then(value => { if (active) setFlow(value); }).catch(() => {});
-    return () => { active = false; };
+    return () => { active = false; window.clearTimeout(reset); };
   }, [initialRunId]);
 
   useEffect(() => {
@@ -175,70 +203,63 @@ export default function Dashboard({ initialRunId }: { initialRunId?: string }) {
       .filter((item): item is string => typeof item === "string");
   }))];
 
-  return <div className="app-shell">
-    <aside className="sidebar">
-      <div className="brand"><div className="brand-mark"><Workflow size={20} /></div><div><strong>ardberg</strong><span>PR TESTING</span></div></div>
-      <div className="sidebar-section">WORKSPACE</div>
-      <button className={["nav-item", tab === "workspace" ? "active" : ""].join(" ")} onClick={() => setTab("workspace")}><LayoutDashboard size={17} /> Overview <ChevronRight size={15} /></button>
-      <button className={["nav-item", tab === "flow" ? "active" : ""].join(" ")} onClick={() => setTab("flow")}><Workflow size={17} /> Agent flow <ChevronRight size={15} /></button>
-      {run && <button className={["nav-item", tab === "interactive" ? "active" : ""].join(" ")} onClick={() => setTab("interactive")}><Play size={17} /> Interactive preview <ChevronRight size={15} /></button>}
-      <div className="sidebar-bottom"><div className="sidebar-help"><CircleHelp size={17} /><div><strong>Agent flow</strong><span>Inspect each node and see how your instruction travels.</span></div></div><div className="sidebar-foot"><span className="online-dot" /> LOCAL WORKSPACE</div></div>
-    </aside>
-    <main className="main-area">
-      <header className="topbar"><div className="breadcrumb">Workspace <ChevronRight size={14} /> <strong>{tab === "flow" ? "Agent flow" : tab === "interactive" ? "Interactive preview" : "Overview"}</strong></div><div className="topbar-right"><span className={["topbar-pill", connections ? (connections.github.connected ? "connected" : "disconnected") : "checking"].join(" ")}>{connections?.github.connected ? <ShieldCheck size={14} /> : connections ? <X size={14} /> : <LoaderCircle size={14} className="spin" />}{connections ? (connections.github.connected ? "GitHub connected" : "GitHub disconnected") : "Checking GitHub"}</span><span className={["topbar-pill", connections ? (connections.model.connected ? "connected" : "disconnected") : "checking"].join(" ")}>{connections?.model.connected ? <ShieldCheck size={14} /> : connections ? <X size={14} /> : <LoaderCircle size={14} className="spin" />}{connections ? (connections.model.connected ? "Model connected" : "Model disconnected") : "Checking model"}</span><span className="avatar">A</span></div></header>
+  return <SidebarProvider className="min-h-svh">
+    <Sidebar collapsible="icon" className="border-r border-sidebar-border">
+      <SidebarHeader className="p-3 group-data-[collapsible=icon]:p-2"><div className="flex items-center gap-3 rounded-lg px-2 py-2 group-data-[collapsible=icon]:justify-center group-data-[collapsible=icon]:p-0"><div className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-sidebar-primary text-sidebar-primary-foreground group-data-[collapsible=icon]:size-8"><Workflow size={18} /></div><div className="group-data-[collapsible=icon]:hidden"><strong className="block text-base leading-none">ardberg</strong><span className="text-[10px] tracking-[.18em] text-muted-foreground">PR TESTING</span></div></div></SidebarHeader>
+      <SidebarContent><SidebarGroup><SidebarGroupLabel>Workspace</SidebarGroupLabel><SidebarGroupContent><SidebarMenu>
+        <SidebarMenuItem><SidebarMenuButton isActive={tab === "workspace"} onClick={() => setTab("workspace")} tooltip="Overview"><LayoutDashboard /> Overview</SidebarMenuButton></SidebarMenuItem>
+        <SidebarMenuItem><SidebarMenuButton isActive={tab === "flow"} onClick={() => setTab("flow")} tooltip="Agent flow"><Workflow /> Agent flow</SidebarMenuButton></SidebarMenuItem>
+        {run && <SidebarMenuItem><SidebarMenuButton isActive={tab === "interactive"} onClick={() => setTab("interactive")} tooltip="Interactive preview"><Play /> Interactive preview</SidebarMenuButton></SidebarMenuItem>}
+      </SidebarMenu></SidebarGroupContent></SidebarGroup></SidebarContent>
+      <SidebarFooter className="p-3"><div className="rounded-lg border border-sidebar-border bg-sidebar-accent/50 p-3 text-xs group-data-[collapsible=icon]:hidden"><div className="mb-1 flex items-center gap-2 font-semibold"><CircleHelp size={15} /> Agent flow</div><p className="m-0 text-muted-foreground">Inspect each node and how your instruction travels.</p></div><div className="flex items-center gap-2 px-2 text-[10px] font-medium text-muted-foreground group-data-[collapsible=icon]:hidden"><span className="size-2 rounded-full bg-emerald-500" /> LOCAL WORKSPACE</div></SidebarFooter>
+    </Sidebar>
+    <SidebarInset className="min-w-0">
+      <header className="topbar"><div className="flex items-center gap-3"><SidebarTrigger /><Separator orientation="vertical" className="h-5" /><Breadcrumb><BreadcrumbList><BreadcrumbItem>Workspace</BreadcrumbItem><BreadcrumbSeparator /><BreadcrumbItem><BreadcrumbPage>{tab === "flow" ? "Agent flow" : tab === "interactive" ? "Interactive preview" : "Overview"}</BreadcrumbPage></BreadcrumbItem></BreadcrumbList></Breadcrumb></div><div className="topbar-right"><ConnectionBadge label="GitHub" icon={<Github />} connected={Boolean(connections?.github.connected)} checked={Boolean(connections)} error={connections?.github.error} /><ConnectionBadge label="Model" icon={<Bot />} connected={Boolean(connections?.model.connected)} checked={Boolean(connections)} error={connections?.model.error} /><Avatar size="sm"><AvatarFallback>A</AvatarFallback></Avatar></div></header>
       {tab === "flow" ? (flow && (!initialRunId || flow.run?.id === initialRunId) ? <AgentFlow key={flow.run?.id ?? "reference"} flow={flow} instruction={instruction} /> : <div className="loading-page"><LoaderCircle className="spin" /> Loading this run’s agent flow...</div>) : tab === "interactive" && run ? <InteractivePreview run={run} /> :
       <div className="workspace-content">
-        <div className="page-intro"><div><div className="eyebrow"><span className="eyebrow-line" /> AUTOMATED PR REVIEW</div><h1>{run ? "Run overview" : "Test a pull request"}</h1><p>{run ? "Track the agents, test execution, and evidence for this review." : "Give the agents a PR and tell them what behavior matters. Follow every step as it runs."}</p></div><button className="ghost-button" onClick={newRun}><Plus size={16} /> New run</button></div>
-        {error && <div className="error-banner"><X size={17} /><span>{error}</span>{installUrl && <a href={installUrl} target="_blank" rel="noreferrer">Install GitHub App <ExternalLink size={14} /></a>}</div>}
-        {health && (!health.github_configured || !health.model_configured) && <div className="setup-banner"><CircleHelp size={18} /><span>Setup needed: {[
+        <div className="page-intro"><div><div className="eyebrow"><span className="eyebrow-line" /> AUTOMATED PR REVIEW</div><h1>{run ? "Run overview" : "Test a pull request"}</h1><p>{run ? "Track the agents, test execution, and evidence for this review." : "Give the agents a PR and tell them what behavior matters. Follow every step as it runs."}</p></div><Button className="ghost-button" onClick={newRun}><Plus size={16} /> New run</Button></div>
+        {error && <Alert variant="destructive" className="mb-4 flex items-center gap-2"><X size={17} /><AlertDescription>{error}</AlertDescription>{installUrl && <a className="ml-auto inline-flex items-center gap-1" href={installUrl} target="_blank" rel="noreferrer">Install GitHub App <ExternalLink size={14} /></a>}</Alert>}
+        {health && (!health.github_configured || !health.model_configured) && <Alert className="mb-4 flex items-center gap-2"><CircleHelp size={18} /><AlertDescription>Setup needed: {[
           !health.github_configured ? "GitHub App credentials" : "",
           !health.model_configured ? "OpenAI API key" : "",
-        ].filter(Boolean).join(" and ")} are missing from the backend environment.</span></div>}
-        {connections && ((health?.github_configured && !connections.github.connected) || (health?.model_configured && !connections.model.connected)) && <div className="setup-banner"><CircleHelp size={18} /><span>{[
+        ].filter(Boolean).join(" and ")} are missing from the backend environment.</AlertDescription></Alert>}
+        {connections && ((health?.github_configured && !connections.github.connected) || (health?.model_configured && !connections.model.connected)) && <Alert className="mb-4 flex items-center gap-2"><CircleHelp size={18} /><AlertDescription>{[
           health?.github_configured && !connections.github.connected ? connections.github.error : "",
           health?.model_configured && !connections.model.connected ? connections.model.error : "",
-        ].filter(Boolean).join(" · ")}</span></div>}
+        ].filter(Boolean).join(" · ")}</AlertDescription></Alert>}
         {!run ? <><div className="intake-grid">
-          <section className="panel intake-panel"><div className="panel-title"><span className="step-number">01</span><div><h2>Choose a pull request</h2><p>Connect a repository with the GitHub App.</p></div></div><p className="helper-row">Analyzing a selected PR sends repository source snippets and diff context to the configured OpenAI model.</p><form onSubmit={resolveRepo}><label htmlFor="repo-url">GitHub repository or PR link</label><div className="url-row"><GitBranch size={18} /><input id="repo-url" value={url} onChange={event => setUrl(event.target.value)} placeholder="https://github.com/owner/repository/pull/42" required /><button type="submit" disabled={busy}>{busy ? <LoaderCircle className="spin" size={16} /> : <ArrowRight size={17} />}</button></div></form>
-            {resolved && <div className="pr-list"><div className="field-heading">{resolved.repository} <span>{resolved.pull_requests.length} open PRs</span></div>{resolved.pull_requests.length ? resolved.pull_requests.map(pr => <button key={pr.number} className={["pr-option", selectedPr?.number === pr.number ? "selected" : ""].join(" ")} onClick={() => { if (selectedPr?.number !== pr.number) { setPreview(null); setFrameworks([]); setPreviewing(true); setSelectedPr(pr); } }}><div className="pr-icon"><GitPullRequest size={17} /></div><div><strong>#{pr.number} {pr.title}</strong><small>{pr.head_sha.slice(0, 10)}</small></div><span className="radio-circle" /></button>) : <p className="empty-text">No open pull requests found.</p>}</div>}
-          </section>
-          <section className="panel instruction-panel">
-            <div className="panel-title"><span className="step-number">02</span><div><h2>Set the testing intent</h2><p>Optional. Leave it blank to review the PR's changed feature automatically.</p></div></div>
-            <label htmlFor="instruction">What should be tested? (optional)</label>
-            <textarea id="instruction" value={instruction} onChange={event => setInstruction(event.target.value)} placeholder="For the login form, wrong passwords must show an error without creating a session. Valid credentials must open the dashboard." rows={7} />
+          <Card className="panel intake-panel"><CardHeader className="panel-title p-0"><span className="step-number">01</span><div><CardTitle>Choose a pull request</CardTitle><CardDescription>Connect a repository with the GitHub App.</CardDescription></div></CardHeader><p className="helper-row">Analyzing a selected PR sends repository source snippets and diff context to the configured OpenAI model.</p><form onSubmit={resolveRepo}><Label htmlFor="repo-url">GitHub repository or PR link</Label><div className="url-row"><GitBranch size={18} /><Input id="repo-url" value={url} onChange={event => setUrl(event.target.value)} placeholder="https://github.com/owner/repository/pull/42" required /><Button type="submit" size="icon" aria-label="Find pull requests" disabled={busy}>{busy ? <LoaderCircle className="spin" size={16} /> : <ArrowRight size={17} />}</Button></div></form>
+            {resolved && <div className="pr-list"><div className="field-heading">{resolved.repository} <span>{resolved.pull_requests.length} open PRs</span></div>{resolved.pull_requests.length ? resolved.pull_requests.map(pr => <Button key={pr.number} className={["pr-option", selectedPr?.number === pr.number ? "selected" : ""].join(" ")} onClick={() => { if (selectedPr?.number !== pr.number) { setPreview(null); setFrameworks([]); setPreviewing(true); setSelectedPr(pr); } }}><div className="pr-icon"><GitPullRequest size={17} /></div><div><strong>#{pr.number} {pr.title}</strong><small>{pr.head_sha.slice(0, 10)}</small></div><span className="radio-circle" /></Button>) : <p className="empty-text">No open pull requests found.</p>}</div>}
+          </Card>
+          <Card className="panel instruction-panel">
+            <CardHeader className="panel-title p-0"><span className="step-number">02</span><div><CardTitle>Set the testing intent</CardTitle><CardDescription>Optional. Leave it blank to review the PR&apos;s changed feature automatically.</CardDescription></div></CardHeader>
+            <Label htmlFor="instruction">What should be tested? (optional)</Label>
+            <Textarea id="instruction" value={instruction} onChange={event => setInstruction(event.target.value)} placeholder="For the login form, wrong passwords must show an error without creating a session. Valid credentials must open the dashboard." rows={7} />
             <div className="helper-row"><CircleHelp size={14} /> For a focused review, describe an action and expected result. If blank, Ardberg infers checks from the PR and reports any behavior it cannot verify.</div>
             {previewing && <div className="framework-detected"><LoaderCircle size={15} className="spin" /> Detecting repository test framework…</div>}
             {preview && !preview.needs_framework_selection && <div className="framework-detected"><Check size={15} /> Native test framework: <strong>{preview.analysis.native_test_framework}</strong></div>}
             {preview?.needs_framework_selection && <>
               <div className="field-heading framework-heading">Choose a test framework <span>No native test framework found</span></div>
               <div className="framework-options">
-                <button className={frameworks.includes("playwright") ? "selected" : ""} onClick={() => toggleFramework("playwright")}><span className="framework-icon pw">P</span><div><strong>Playwright</strong><small>Browser / API</small></div>{frameworks.includes("playwright") && <Check size={16} />}</button>
-                <button className={frameworks.includes("vitest") ? "selected" : ""} onClick={() => toggleFramework("vitest")}><span className="framework-icon vt">V</span><div><strong>Vitest</strong><small>Unit tests</small></div>{frameworks.includes("vitest") && <Check size={16} />}</button>
+                {(["playwright", "vitest"] as const).map(name => <Label key={name} htmlFor={`framework-${name}`} className="flex flex-1 cursor-pointer items-center gap-3 rounded-lg border border-input p-3 hover:bg-accent"><Checkbox id={`framework-${name}`} checked={frameworks.includes(name)} onCheckedChange={() => toggleFramework(name)} /><span className={`framework-icon ${name === "playwright" ? "pw" : "vt"}`}>{name === "playwright" ? "P" : "V"}</span><span className="flex flex-col"><strong>{name === "playwright" ? "Playwright" : "Vitest"}</strong><small>{name === "playwright" ? "Browser / API" : "Unit tests"}</small></span></Label>)}
               </div>
             </>}
-            <button className="primary-button" disabled={busy || !selectedPr || !preview || previewing} onClick={startRun}><Play size={16} fill="currentColor" /> Start test run <ArrowRight size={17} /></button>
-          </section>
+            <Button className="primary-button" disabled={busy || !selectedPr || !preview || previewing} onClick={startRun}><Play size={16} fill="currentColor" /> Start test run <ArrowRight size={17} /></Button>
+          </Card>
         </div>
-        {recentRuns.length > 0 && <section className="panel recent-runs">
-          <div className="section-header"><div><div className="eyebrow">GITHUB APP + MANUAL RUNS</div><h2>Recent runs</h2></div><RefreshCw size={16} /></div>
-          <div className="recent-run-list">{recentRuns.map(item =>
-            <button key={item.id} className="recent-run" onClick={() => router.push("/runs/" + item.id)}>
-              <span className="recent-run-pr">{item.repository} / #{item.pr_number}</span>
-              <strong>{item.title || "PR testing run"}</strong>
-              <span className="recent-run-sha">{item.head_sha.slice(0, 10)}</span>
-              <span className={["status-badge", item.status].join(" ")}>{item.status}</span>
-              <ArrowRight size={15} />
-            </button>)}</div>
-        </section>}</> :
-        <><div className="run-hero panel"><div className="run-hero-main"><span className="run-label"><GitPullRequest size={15} /> {run.repository} · PR #{run.pr_number}</span><h2>{run.title}</h2><div className="run-meta"><span><GitBranch size={14} /> {run.head_sha.slice(0, 12)}</span><span className={["status-badge", run.status].join(" ")}>{run.status}</span><span>Stage: {run.stage}</span></div></div><button className="outline-button" onClick={() => refresh().catch(err => setError(err.message))}><RefreshCw size={15} /> Refresh</button></div>
+        {recentRuns.length > 0 && <Card className="panel recent-runs">
+          <CardHeader className="p-0"><div className="section-header"><div><div className="eyebrow">GITHUB APP + MANUAL RUNS</div><CardTitle>Recent runs</CardTitle></div><RefreshCw size={16} /></div></CardHeader>
+          <CardContent className="p-0"><ScrollArea className="max-h-[420px] w-full"><Table><TableHeader><TableRow><TableHead>Pull request</TableHead><TableHead>Title</TableHead><TableHead>Commit</TableHead><TableHead>Status</TableHead></TableRow></TableHeader><TableBody>{recentRuns.map(item => <TableRow key={item.id}><TableCell><Button variant="link" className="h-auto p-0 text-left" onClick={() => router.push("/runs/" + item.id)}>{item.repository} / #{item.pr_number}</Button></TableCell><TableCell className="max-w-[350px] truncate font-medium">{item.title || "PR testing run"}</TableCell><TableCell className="font-mono text-xs text-muted-foreground">{item.head_sha.slice(0, 10)}</TableCell><TableCell><Badge variant="outline" className={["status-badge", item.status].join(" ")}>{item.status}</Badge></TableCell></TableRow>)}</TableBody></Table></ScrollArea></CardContent>
+        </Card>}</> :
+        <><Card className="run-hero panel"><div className="run-hero-main"><span className="run-label"><GitPullRequest size={15} /> {run.repository} · PR #{run.pr_number}</span><h2>{run.title}</h2><div className="run-meta"><span><GitBranch size={14} /> {run.head_sha.slice(0, 12)}</span><Badge variant="outline" className={["status-badge", run.status].join(" ")}>{run.status}</Badge><span>Stage: {run.stage}</span></div></div><Button variant="outline" className="outline-button" onClick={() => refresh().catch(err => setError(err.message))}><RefreshCw size={15} /> Refresh</Button></Card>
           <ReviewScope run={run} />
-          <div className="stats-row"><div className="stat-card"><span>AGENTS</span><strong>{agentEvents.filter(item => item.current).length}<small> / 3</small></strong><p>with activity</p></div><div className="stat-card"><span>PASSED NODES</span><strong>{passed}</strong><p>completed successfully</p></div><div className="stat-card"><span>FAILED NODES</span><strong>{failed}</strong><p>other branches continue</p></div><div className="stat-card"><span>CURRENT STAGE</span><strong className="stage-value">{run.stage}</strong><p>{run.status}</p></div></div>
-          <div className="run-grid"><section className="panel agent-panel"><div className="section-header"><div><div className="eyebrow">PARALLEL BRANCHES</div><h2>Testing agents</h2></div><button className="text-button" onClick={() => setTab("flow")}>Open flow <ArrowRight size={15} /></button></div>{agentEvents.map(item => <div className="agent-row" key={item.key}><div className={["agent-symbol", item.key].join(" ")}>{item.key === "builtin" ? <GitBranch size={18} /> : item.key === "playwright" ? "P" : "V"}</div><div className="agent-copy"><strong>{agentNames[item.key]}</strong><small>{item.current ? (item.current.node?.replaceAll("_", " ") ?? "") + " · " + item.current.status : agentDescriptions[item.key]}</small></div><span className={["status-badge", item.current?.status ?? "not_started"].join(" ")}>{item.current?.status ?? "waiting"}</span></div>)}</section>
-          <section className="panel activity-panel"><div className="section-header"><div><div className="eyebrow">RUN ACTIVITY</div><h2>Latest events</h2></div><Activity size={18} /></div><div className="activity-list">{events.slice(-8).reverse().map(event => <div className="activity-row" key={event.id}><span className={["activity-dot", event.status].join(" ")} /><div><strong>{event.node?.replaceAll("_", " ") ?? event.stage}</strong><small>{event.agent ?? "supervisor"} · {event.status}</small></div><time>{new Date(event.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time></div>)}{events.length === 0 && <div className="empty-state">Waiting for the first node event…</div>}</div></section></div>
-          <section className="panel results-panel"><div className="section-header"><div><div className="eyebrow">EVIDENCE & REVIEW</div><h2>Agent report</h2></div><span className={["status-badge", run.report ? "passed" : "not_started"].join(" ")}>{run.report ? "ready" : "pending"}</span></div>{run.report ? <article className="report-markdown"><ReactMarkdown components={{ a: ({ href, children }) => { const url = reportHref(href, run.id); return url ? <a href={url} target="_blank" rel="noreferrer">{children}</a> : <span>{children}</span>; } }}>{run.report}</ReactMarkdown></article> : <div className="empty-state"><LoaderCircle size={21} className={run.status === "running" ? "spin" : ""} /> The report appears here when the evidence review finishes.</div>}{run.error && <div className="report-error">{run.error}</div>}{artifacts.length > 0 && <div className="artifacts" id="artifacts"><div className="eyebrow">RUN ARTIFACTS</div><div className="artifact-list">{artifacts.map(path => <a key={path} href={API_URL + "/api/runs/" + run.id + "/artifacts/" + path} target="_blank" rel="noreferrer"><span>{path}</span><ExternalLink size={13} /></a>)}</div></div>}</section>
+          <div className="stats-row"><Card className="stat-card"><span>AGENTS</span><strong>{agentEvents.filter(item => item.current).length}<small> / 3</small></strong><p>with activity</p></Card><Card className="stat-card"><span>PASSED NODES</span><strong>{passed}</strong><p>completed successfully</p></Card><Card className="stat-card"><span>FAILED NODES</span><strong>{failed}</strong><p>other branches continue</p></Card><Card className="stat-card"><span>CURRENT STAGE</span><strong className="stage-value">{run.stage}</strong><p>{run.status}</p></Card></div>
+          <div className="run-grid"><Card className="panel agent-panel"><div className="section-header"><div><div className="eyebrow">PARALLEL BRANCHES</div><h2>Testing agents</h2></div><Button variant="ghost" className="text-button" onClick={() => setTab("flow")}>Open flow <ArrowRight size={15} /></Button></div>{agentEvents.map(item => <div className="agent-row" key={item.key}><div className={["agent-symbol", item.key].join(" ")}>{item.key === "builtin" ? <GitBranch size={18} /> : item.key === "playwright" ? "P" : "V"}</div><div className="agent-copy"><strong>{agentNames[item.key]}</strong><small>{item.current ? (item.current.node?.replaceAll("_", " ") ?? "") + " · " + item.current.status : agentDescriptions[item.key]}</small></div><Badge variant="outline" className={["status-badge", item.current?.status ?? "not_started"].join(" ")}>{item.current?.status ?? "waiting"}</Badge></div>)}</Card>
+          <Card className="panel activity-panel"><div className="section-header"><div><div className="eyebrow">RUN ACTIVITY</div><h2>Latest events</h2></div><Activity size={18} /></div><ScrollArea className="activity-list max-h-[340px]">{events.slice(-8).reverse().map(event => <div className="activity-row" key={event.id}><span className={["activity-dot", event.status].join(" ")} /><div><strong>{event.node?.replaceAll("_", " ") ?? event.stage}</strong><small>{event.agent ?? "supervisor"} · {event.status}</small></div><time>{new Date(event.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time></div>)}{events.length === 0 && <div className="empty-state">Waiting for the first node event…</div>}</ScrollArea></Card></div>
+          <Card className="panel results-panel"><div className="section-header"><div><div className="eyebrow">EVIDENCE & REVIEW</div><h2>Agent report</h2></div><Badge variant="outline" className={["status-badge", run.report ? "passed" : "not_started"].join(" ")}>{run.report ? "ready" : "pending"}</Badge></div>{run.report ? <ScrollArea className="report-scroll h-[min(680px,70vh)] w-full min-w-0 max-w-full"><article className="report-markdown"><ReactMarkdown components={{ a: ({ href, children }) => { const url = reportHref(href, run.id); return url ? <a href={url} target="_blank" rel="noreferrer">{children}</a> : <span>{children}</span>; } }}>{run.report}</ReactMarkdown></article></ScrollArea> : <div className="empty-state"><LoaderCircle size={21} className={run.status === "running" ? "spin" : ""} /> The report appears here when the evidence review finishes.</div>}{run.error && <Alert variant="destructive"><AlertDescription>{run.error}</AlertDescription></Alert>}{artifacts.length > 0 && <div className="artifacts" id="artifacts"><div className="eyebrow">RUN ARTIFACTS</div><ScrollArea className="max-h-52"><div className="artifact-list">{artifacts.map(path => <a key={path} href={API_URL + "/api/runs/" + run.id + "/artifacts/" + path} target="_blank" rel="noreferrer"><span>{path}</span><ExternalLink size={13} /></a>)}</div></ScrollArea></div>}</Card>
         </>}
-        <footer className="footer">Ardberg · Pinned-commit testing · Validated tests commit after passing suites</footer>
       </div>}
-    </main>
-  </div>;
+      <footer className="footer mx-auto w-full max-w-[1330px] px-6 pb-5"><Separator className="mb-4" /><span>Ardberg · Pinned commit testing · Validated tests commit after passing suites</span></footer>
+    </SidebarInset>
+  </SidebarProvider>;
 }

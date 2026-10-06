@@ -36,6 +36,7 @@ class Settings:
     max_archive_member_bytes: int = int(os.getenv("MAX_ARCHIVE_MEMBER_BYTES", str(100 * 1024 * 1024)))
     node_timeout_seconds: int = int(os.getenv("NODE_TIMEOUT_SECONDS", "180"))
     test_timeout_seconds: int = int(os.getenv("TEST_TIMEOUT_SECONDS", "900"))
+    setup_repair_limit: int = max(0, min(5, int(os.getenv("SETUP_REPAIR_LIMIT", "2"))))
 
 
 settings = Settings()
