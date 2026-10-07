@@ -21,8 +21,24 @@ def artifact_path(run_id: str, relative: str) -> Path:
 def write_artifact(run_id: str, relative: str, content: str | bytes) -> str:
     target = artifact_path(run_id, relative)
     target.parent.mkdir(parents=True, exist_ok=True)
-    if isinstance(content, bytes):
-        target.write_bytes(content)
-    else:
-        target.write_text(content, encoding="utf-8")
-    return relative.replace("\\", "/")
+    data = content if isinstance(content, bytes) else content.encode("utf-8")
+    relative = relative.replace("\\", "/")
+    from .db import session_scope
+    from .models import StoredArtifact
+    with session_scope() as session:
+        session.merge(StoredArtifact(run_id=run_id, path=relative, content=data))
+    target.write_bytes(data)
+    return relative
+
+
+def restore_artifact(run_id: str, relative: str) -> Path:
+    target = artifact_path(run_id, relative)
+    if not target.is_file():
+        from .db import session_scope
+        from .models import StoredArtifact
+        with session_scope() as session:
+            saved = session.get(StoredArtifact, (run_id, relative.replace("\\", "/")))
+            if saved is not None:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(saved.content)
+    return target

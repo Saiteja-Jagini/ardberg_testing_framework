@@ -20,7 +20,8 @@ from .schemas import FrameworkAnalysis, InstructionAssessment, TestPlan, TestSer
 MANIFEST_NAMES = {
     "package.json", "playwright.config.ts", "playwright.config.js",
     "vitest.config.ts", "vitest.config.js", "vite.config.ts",
-    "pyproject.toml", "pytest.ini", "setup.cfg", "requirements.txt",
+    "pyproject.toml", "pytest.ini", "setup.py", "setup.cfg", "requirements.txt",
+    "local-requirements.txt", "CONTRIBUTING.md",
     "Makefile", "go.mod", "Cargo.toml", "composer.json",
 }
 
@@ -258,6 +259,10 @@ async def analyze_repository(repository: str, changed: list[dict], source: Path,
     analysis = await parse(
         "Analyze the repository's actual files. Identify its application and existing test framework, "
         "package manager, working install/test/start commands, and whether Playwright or Vitest can test it. "
+        "Read contributor and CI build instructions before choosing installation commands. "
+        "An editable Python install may omit generated or bundled runtime files: include the "
+        "repository's documented wheel/build step before browser installation when it supplies "
+        "the driver. Preserve the pinned source; never substitute the published package under review. "
         "Return only a minimal set of distinct existing test suite commands; omit aliases that run the same suite. "
         "List security_check_commands only when exact commands are declared in repository manifests or CI. "
         "Include existing secret, dependency, static source, or configuration scans when available. "
@@ -462,7 +467,7 @@ async def prepare_run(run_id: str) -> dict:
         source, [item["filename"] for item in changed], run["instruction"],
     )
     set_run(run_id, title=pr["title"], head_sha=head_sha, base_sha=base_sha,
-            context={"mode": "critique" if review_mode else "testing",
+            context={**run["context"], "mode": "critique" if review_mode else "testing",
                      "head_sha": head_sha, "base_sha": base_sha,
                      "instruction_source": "automatic_pending" if not run["instruction"].strip() else "user",
                      "changed_files": compact_changes(changed)[:200],
@@ -628,6 +633,7 @@ async def prepare_run(run_id: str) -> dict:
         enabled, inactive_reasons = select_agents(analysis.model_dump(), files, selected)
     context = {
         "mode": "critique" if review_mode else "testing",
+        "publish_to_github": run["context"].get("publish_to_github", True),
         "repository": run["repository"], "pr_number": run["pr_number"],
         "title": pr["title"], "head_sha": head_sha, "base_sha": base_sha,
         "instruction": effective_instruction, "user_instruction": run["instruction"],

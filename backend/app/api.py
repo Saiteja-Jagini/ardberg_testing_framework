@@ -145,7 +145,7 @@ async def resolve(request: ResolveRequest):
 async def _start_run(repository: str, number: int, instruction: str,
                      selected_frameworks: list[str], installation_id: int,
                      expected_head: str | None = None,
-                     mode: str = "critique") -> str:
+                     mode: str = "critique", publish_to_github: bool = True) -> str:
     github = GitHubApp()
     token = await github.installation_token(installation_id)
     pr = await github.pull_request(repository, number, token)
@@ -155,7 +155,7 @@ async def _start_run(repository: str, number: int, instruction: str,
         run = Run(repository=repository, pr_number=number, installation_id=installation_id,
                   title=pr["title"], head_sha=pr["head"]["sha"], base_sha=pr["base"]["sha"],
                   instruction=instruction, selected_frameworks=selected_frameworks,
-                  context={"mode": mode})
+                  context={"mode": mode, "publish_to_github": publish_to_github})
         session.add(run)
         session.flush()
         run_id = run.id
@@ -171,7 +171,8 @@ async def _start_run(repository: str, number: int, instruction: str,
             setting.selected_frameworks = selected_frameworks
     check_id = None
     try:
-        check_id = await github.create_check(repository, pr["head"]["sha"], token, "Ardberg PR review")
+        if publish_to_github:
+            check_id = await github.create_check(repository, pr["head"]["sha"], token, "Ardberg PR review")
         with session_scope() as session:
             session.get(Run, run_id).check_run_id = check_id
         client = await Client.connect(settings.temporal_address)
@@ -204,7 +205,7 @@ async def create_run(request: CreateRunRequest):
         installation_id = int(installation["id"])
         run_id = await _start_run(repository, request.pr_number, request.instruction,
                                   request.selected_frameworks, installation_id,
-                                  mode=request.mode)
+                                  mode=request.mode, publish_to_github=request.publish_to_github)
         return {"run_id": run_id}
     except (ValueError, GitHubError) as exc:
         raise HTTPException(422, str(exc)) from exc
@@ -256,6 +257,39 @@ def read_events(run_id: str, after: int = 0):
         return get_events(run_id, after)
     except LookupError as exc:
         raise HTTPException(404, str(exc)) from exc
+
+
+@app.post("/api/runs/{run_id}/retry-review")
+async def retry_pinned_review(run_id: str, replan_runtime: bool = True):
+    """Retry runtime planning/execution after setup recovery, preserving pinned intent/source."""
+    from .artifacts import restore_artifact, write_artifact
+    from .events import set_run
+    try:
+        run = get_run(run_id)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    if run["status"] not in {"failed", "completed"} or run["context"].get("mode") != "critique":
+        raise HTTPException(409, "Only a finished critique can retry its pinned runtime review")
+    if not run["context"].get("source_path") or not Path(run["context"]["source_path"]).is_dir():
+        raise HTTPException(409, "Pinned source is unavailable; start a new review")
+    for name in ("expectations", "code-critique"):
+        if not restore_artifact(run_id, f"review/{name}.json").is_file():
+            raise HTTPException(409, "Source analysis is incomplete; start a new review")
+    if not replan_runtime and not restore_artifact(run_id, "review/runtime-plan.json").is_file():
+        raise HTTPException(409, "Runtime plan is unavailable; retry with planning enabled")
+    if run["report"]:
+        write_artifact(run_id, "review/previous-report.md", run["report"])
+    set_run(run_id, context={**run["context"], "resume_source_review": True,
+                            "resume_runtime_plan": not replan_runtime},
+            status="queued", stage="review", error=None, report=None)
+    try:
+        client = await Client.connect(settings.temporal_address)
+        await client.start_workflow(ReviewWorkflow.run, run_id,
+            id=f"ardberg-{run_id}-retry-{uuid4().hex[:8]}", task_queue=settings.temporal_task_queue)
+    except Exception as exc:
+        set_run(run_id, status="failed", error=f"Could not retry runtime review: {exc}")
+        raise HTTPException(503, "Could not start runtime review retry") from exc
+    return {"run_id": run_id}
 
 
 @app.get("/api/runs/{run_id}/interactive-preview")
@@ -450,8 +484,11 @@ async def stream_events(run_id: str, request: Request, after: int = 0):
 @app.get("/api/runs/{run_id}/artifacts/{relative:path}")
 def download_artifact(run_id: str, relative: str):
     try:
-        get_run(run_id)
-        path = artifact_path(run_id, relative)
+        run = get_run(run_id)
+        from .artifacts import restore_artifact, write_artifact
+        path = restore_artifact(run_id, relative)
+        if relative == "report.md" and not path.is_file() and run.get("report"):
+            write_artifact(run_id, relative, run["report"])
     except (LookupError, ValueError) as exc:
         raise HTTPException(404, str(exc)) from exc
     if not path.is_file() or "source" in Path(relative).parts or "workspace" in Path(relative).parts:

@@ -4,7 +4,7 @@ import re
 from pathlib import Path
 from sqlalchemy import select
 
-from .artifacts import artifact_path, write_artifact
+from .artifacts import artifact_path, restore_artifact, write_artifact
 from .config import settings
 from .db import session_scope
 from .events import emit, get_events, get_run, set_run
@@ -82,7 +82,33 @@ def claimed_source_excerpt(context: dict, relative: str, limit: int = 20_000) ->
         return ""
 
 
-def _critique_fallback(run: dict, outcome: dict) -> str:
+def _current_attempt_events(events: list[dict]) -> list[dict]:
+    """Keep prior source evidence, but exclude superseded execution from retry results."""
+    retry = next((index for index in range(len(events) - 1, -1, -1)
+                  if events[index].get("node") == "reuse_pinned_context"), None)
+    return events[retry:] if retry is not None else events
+
+
+def _execution_record(outcome: dict, events: list[dict]) -> str:
+    """Render execution facts directly; planning prose cannot override this record."""
+    observations = outcome.get("runtime", {}).get("observations", [])
+    lines = ["## Verified execution record", "", "| Revision | Observed | Failed | Blocked |",
+             "| --- | ---: | ---: | ---: |"]
+    for revision in ("head", "base"):
+        selected = [o for o in observations if o["revision"] == revision]
+        counts = [sum(o["status"] == status for o in selected) for status in ("observed", "failed", "blocked")]
+        lines.append(f"| {revision} | {counts[0]} | {counts[1]} | {counts[2]} |")
+    lines += ["", "Observed means the probe executed and produced evidence; it does not mean every requirement passed.", ""]
+    for event in _current_attempt_events(events):
+        detail = event.get("detail") or {}
+        if event.get("stage") == "runtime" and event.get("status") in {"passed", "failed"} and detail.get("command"):
+            command = str(detail["command"]).replace("`", "'")
+            lines.append(f"- `{command}`: **{event['status']}** [event:{event['id']}].")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _critique_fallback(run: dict, outcome: dict, events: list[dict] | None = None) -> str:
     """Render validated structured evidence if narrative generation is unavailable."""
     judgment = outcome.get("judgment") or {}
     expectations = (outcome.get("expectations") or {}).get("expectations", [])
@@ -141,7 +167,7 @@ def _critique_fallback(run: dict, outcome: dict) -> str:
     lines += ["", "## Supporting checks", "",
               "This critique run did not run the repository's full test suite or generate test commits. "
               "A completed run means the review finished; unverified behavior remains unverified.", ""]
-    return "\n".join(lines)
+    return "\n".join(lines) + "\n" + _execution_record(outcome, events or [])
 
 
 def evidence_artifact_excerpts(run_id: str, events: list[dict]) -> dict[str, str]:
@@ -161,7 +187,7 @@ def evidence_artifact_excerpts(run_id: str, events: list[dict]) -> dict[str, str
         if remaining <= 0:
             break
         try:
-            artifact = artifact_path(run_id, relative)
+            artifact = restore_artifact(run_id, relative)
             if not artifact.is_file() or artifact.suffix.lower() not in {
                 ".txt", ".log", ".json", ".md", ".diff", ".sql",
             }:
@@ -199,7 +225,7 @@ def _check_claim_links(run_id: str, draft: ReportDraft, events: list[dict],
                 errors.append(f"Claim expects {claim.expected_status}, event {event_id} is {event['status']}")
         for path in claim.artifact_paths:
             try:
-                if not artifact_path(run_id, path).is_file():
+                if not restore_artifact(run_id, path).is_file():
                     errors.append(f"Claim references missing artifact {path}")
             except ValueError:
                 errors.append(f"Claim references invalid artifact {path}")
@@ -237,7 +263,7 @@ def evidence_counts(events: list[dict], outcome: dict) -> dict:
 
 def classify_failure(events: list[dict]) -> list[dict]:
     classifications = []
-    for event in events:
+    for event in _current_attempt_events(events):
         if event["status"] != "failed":
             continue
         stage = event["stage"]
@@ -351,10 +377,12 @@ async def generate_report(run_id: str, outcome: dict) -> str:
         "instruction_source": run["context"].get("instruction_source", "user"),
         "context": report_context,
         "outcome": report_outcome, "events": events, "classifications": classifications,
+        "current_attempt_event_ids": [event["id"] for event in _current_attempt_events(events)],
         "manual_observations": manual_observations,
         "evidence_counts": evidence_counts(events, outcome),
         "changed_documents": changed_document_context(run["context"]),
         "artifact_excerpts": evidence_artifact_excerpts(run_id, events),
+        "execution_record": _execution_record(outcome, events) if outcome.get("mode") == "critique" else "",
     }
     prompt_name = "critique_report.txt" if outcome.get("mode") == "critique" else "report.txt"
     prompt = (Path(__file__).parent / "prompts" / prompt_name).read_text(encoding="utf-8")
@@ -367,6 +395,9 @@ async def generate_report(run_id: str, outcome: dict) -> str:
     prompt += ("\nWhen the payload contains correction, revise the entire report to remove "
                "or narrow every flagged claim. Cite only evidence present in the payload. "
                "Prefer a shorter accurate report to an unsupported conclusion.")
+    prompt += ("\nEvents outside current_attempt_event_ids are historical evidence. "
+               "A retry supersedes their execution results; do not present earlier setup "
+               "or probe failures as blockers for this attempt.")
     for attempt in range(3):
         emit(run_id, "report", "running", agent="report", node="write_analysis",
              detail={"attempt": attempt + 1})
@@ -380,7 +411,7 @@ async def generate_report(run_id: str, outcome: dict) -> str:
                 raise
             emit(run_id, "report", "retrying", agent="report", node="write_analysis",
                  detail={"reason": f"Narrative unavailable: {type(exc).__name__}; using structured evidence"})
-            markdown = _critique_fallback(run, outcome)
+            markdown = _critique_fallback(run, outcome, events)
             path = write_artifact(run_id, "report.md", markdown)
             set_run(run_id, report=markdown)
             emit(run_id, "report", "passed", agent="report", node="write_analysis",
@@ -401,7 +432,7 @@ async def generate_report(run_id: str, outcome: dict) -> str:
             claimed_artifacts = {path for claim in draft.claims for path in claim.artifact_paths}
             artifact_excerpts = dict(payload["artifact_excerpts"])
             for path in claimed_artifacts:
-                artifact = artifact_path(run_id, path)
+                artifact = restore_artifact(run_id, path)
                 if artifact.suffix.lower() in {".txt", ".log", ".json", ".md", ".diff", ".sql"}:
                     artifact_excerpts[path] = _artifact_excerpt(artifact, 20_000)
             verification = await parse(VERIFIER_PROMPT, {
@@ -431,11 +462,14 @@ async def generate_report(run_id: str, outcome: dict) -> str:
                 "artifact_excerpts": artifact_excerpts,
                 "evidence_counts": payload["evidence_counts"],
                 "manual_observations": manual_observations,
+                "execution_record": payload["execution_record"],
             }, ReportVerification)
         if not link_errors and verification and verification.supported:
             emit(run_id, "report", "passed", agent="report", node="verify_evidence",
                  success=True, detail={"cited_event_ids": sorted(draft.evidence_event_ids),
                                        "checked_claims": len(draft.claims)})
+            if outcome.get("mode") == "critique":
+                draft.markdown += "\n\n" + payload["execution_record"]
             path = write_artifact(run_id, "report.md", draft.markdown)
             set_run(run_id, report=draft.markdown)
             emit(run_id, "report", "artifact", agent="report", node="write_analysis",
@@ -453,7 +487,7 @@ async def generate_report(run_id: str, outcome: dict) -> str:
         emit(run_id, "report", "failed", agent="report", node="verify_evidence",
              success=False, detail={"error": "; ".join(reasons)})
         if outcome.get("mode") == "critique":
-            markdown = _critique_fallback(run, outcome)
+            markdown = _critique_fallback(run, outcome, events)
             path = write_artifact(run_id, "report.md", markdown)
             set_run(run_id, report=markdown)
             emit(run_id, "report", "passed", agent="report", node="write_analysis",
@@ -465,6 +499,10 @@ async def generate_report(run_id: str, outcome: dict) -> str:
 
 async def publish_report(run_id: str, markdown: str, success: bool | str):
     run = get_run(run_id)
+    if run["context"].get("publish_to_github") is False:
+        emit(run_id, "report", "not_selected", agent="report", node="publish",
+             detail={"reason": "Local review: GitHub publication disabled"})
+        return
     with session_scope() as session:
         db_run = session.get(Run, run_id)
         installation_id = db_run.installation_id

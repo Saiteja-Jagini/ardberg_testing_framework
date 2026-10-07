@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 from uuid import uuid4
-from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Integer, JSON, String, Text
+from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Integer, JSON, LargeBinary, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 from .db import Base
 
@@ -44,6 +44,15 @@ class RunEvent(Base):
     success: Mapped[bool | None] = mapped_column(nullable=True)
     detail: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class StoredArtifact(Base):
+    """Durable evidence independent of disposable checkouts and local file caches."""
+    __tablename__ = "stored_artifacts"
+
+    run_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    path: Mapped[str] = mapped_column(String(1000), primary_key=True)
+    content: Mapped[bytes] = mapped_column(LargeBinary)
 
 
 class InteractivePreview(Base):

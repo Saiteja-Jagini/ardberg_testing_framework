@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import secrets
+import shlex
 from pathlib import Path
 from urllib.parse import urlsplit
 from uuid import uuid4
@@ -12,7 +13,81 @@ from .artifacts import artifact_path, write_artifact
 from .config import settings
 from .events import emit
 from .runner import (_command, _environment_args, _postgres_image,
-                     _run_setup_with_repair, _start_postgres, _test_environment)
+                     _repair_command_allowed, _run_setup_with_repair, _start_postgres, _test_environment)
+
+
+def _setup_key(command: str) -> tuple[str, ...]:
+    """Recognize equivalent install spellings without rewriting the executed command."""
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return (command,)
+    if len(parts) > 2 and parts[0] == "timeout" and parts[1].rstrip("smhd").isdigit():
+        parts = parts[2:]
+    if parts[:3] in (["python", "-m", "pip"], ["python3", "-m", "pip"]):
+        parts = ["pip", *parts[3:]]
+    if parts[:3] in (["python", "-m", "playwright"], ["python3", "-m", "playwright"]):
+        parts = ["playwright", *parts[3:]]
+    return tuple(parts)
+
+
+def _setup_phases(analysis: dict, source: Path) -> tuple[list[str], list[str]]:
+    """Install dependencies before isolation and retain fixture setup for service startup."""
+    installs = list(analysis.get("install_commands", []))
+    seen = {_setup_key(command) for command in installs}
+    fixtures = []
+    for command in analysis.get("runtime_setup_commands", []):
+        key = _setup_key(command)
+        if key in seen:
+            continue
+        seen.add(key)
+        dependency = shlex.join(key)
+        if (key[:2] == ("playwright", "install") or
+                _repair_command_allowed(dependency, "", source)):
+            installs.append(command)
+        else:
+            fixtures.append(command)
+    return installs, fixtures
+
+
+async def _start_processes(run_id: str, container: str, revision: str,
+                           processes: list[dict], target_url: str,
+                           environment: dict[str, str], prefix: str) -> tuple[str, str]:
+    """Start only required processes and verify each endpoint before dependent probes."""
+    for index, process in enumerate(processes):
+        parsed = urlsplit(process["ready_url"])
+        if (parsed.scheme not in {"http", "https"} or parsed.hostname not in
+                {"localhost", "127.0.0.1", "0.0.0.0"} or not parsed.port):
+            return "", "No evidenced local start command and readiness URL"
+        log_file = f"/tmp/ardberg-app-{index}.log"
+        code, output = await _command(
+            "docker", "exec", "-d", *_environment_args(environment), container,
+            "sh", "-lc", f"({process['command']}) > {log_file} 2>&1", timeout=30)
+        if code:
+            return "", f"Application startup failed: {output}"
+        ready = f"{parsed.scheme}://127.0.0.1:{parsed.port}{parsed.path or '/'}"
+        if parsed.query:
+            ready += "?" + parsed.query
+        for _ in range(60):
+            code, status = await _command(
+                "docker", "exec", container, "curl", "--max-time", "2", "-sS",
+                "-o", "/dev/null", "-w", "%{http_code}", ready, timeout=5)
+            response = int(status.strip()) if status.strip().isdigit() else 0
+            if code == 0 and (200 <= response < 400 or response in {401, 403}):
+                emit(run_id, "runtime", "passed", agent="runner",
+                     node=f"{revision}_ready_{index}", success=True,
+                     detail={"command": process["command"], "ready_url": ready,
+                             "response_status": response})
+                break
+            await asyncio.sleep(1)
+        else:
+            _, log = await _command("docker", "exec", container, "cat", log_file, timeout=20)
+            path = write_artifact(run_id, f"{prefix}/application-{index}.log", log)
+            return "", f"Application did not become ready; see {path}"
+    parsed = urlsplit(target_url)
+    if not processes or not parsed.port or parsed.hostname not in {"localhost", "127.0.0.1", "0.0.0.0"}:
+        return "", "No evidenced application process and target URL"
+    return f"{parsed.scheme}://127.0.0.1:{parsed.port}", ""
 
 
 async def _observe(run_id: str, container: str, revision: str, probe,
@@ -41,7 +116,8 @@ async def _observe(run_id: str, container: str, revision: str, probe,
                                   "NODE_PATH": "/workspace/node_modules"}
             code, output = await _command(
                 "docker", "exec", *_environment_args(script_environment), container,
-                command, remote, timeout=min(settings.test_timeout_seconds, 120),
+                command, *(["-P"] if probe.interpreter == "python" else []), remote,
+                timeout=min(settings.test_timeout_seconds, 120),
             )
         elif probe.kind == "http":
             if not origin:
@@ -68,12 +144,13 @@ async def _observe(run_id: str, container: str, revision: str, probe,
             code, output = await _command("docker", "exec", container, "node",
                                           "/tmp/ardberg-runtime-probe.cjs",
                                           f"/tmp/ardberg-{name}.json", timeout=90)
-            if code == 0:
-                path = artifact_path(run_id, f"{prefix}.png")
-                copied, _ = await _command("docker", "cp", f"{container}:{screenshot}",
-                                           str(path), timeout=30)
-                if copied == 0:
-                    detail["screenshot"] = f"{prefix}.png"
+            # A failed interaction can still produce useful visual evidence.
+            path = artifact_path(run_id, f"{prefix}.png")
+            copied, _ = await _command("docker", "cp", f"{container}:{screenshot}",
+                                       str(path), timeout=30)
+            if copied == 0:
+                write_artifact(run_id, f"{prefix}.png", path.read_bytes())
+                detail["screenshot"] = f"{prefix}.png"
         log = write_artifact(run_id, f"{prefix}.log", output)
         detail.update({"status": "observed" if code == 0 else "failed",
                        "exit_code": code, "log": log,
@@ -98,6 +175,7 @@ async def _run_revision(run_id: str, context: dict, revision: str, probes: list)
                  "revision": revision, "kind": item.kind, "status": "blocked",
                  "error": "Pinned source snapshot unavailable"} for item in probes]
     analysis = context["analysis"]
+    setup_prefix = f"review/runtime/{revision}/setup-{context.get('runtime_environment_id', 'default')}"
     suffix = uuid4().hex[:8]
     container = f"ardberg-review-{revision}-{suffix}"
     network = f"{container}-net"
@@ -106,6 +184,7 @@ async def _run_revision(run_id: str, context: dict, revision: str, probes: list)
     network_started = False
     database_started = False
     observations = []
+    processes = []
     try:
         emit(run_id, "runtime", "running", agent="runner", node=f"{revision}_setup")
         code, output = await _command("docker", "run", "-d", "--name", container,
@@ -122,11 +201,12 @@ async def _run_revision(run_id: str, context: dict, revision: str, probes: list)
                                       f"{container}:/workspace", timeout=180)
         if code:
             raise RuntimeError(f"Could not copy pinned source: {output}")
-        for index, command in enumerate(analysis.get("install_commands", [])):
+        install_commands, runtime_fixtures = _setup_phases(analysis, source)
+        for index, command in enumerate(install_commands):
             await _run_setup_with_repair(
                 run_id, stage="runtime", agent="runner", node=f"{revision}_install_{index + 1}",
                 container=container, command=command,
-                log_prefix=f"review/runtime/{revision}/install-{index + 1}",
+                log_prefix=f"{setup_prefix}/install-{index + 1}",
                 workspace=source,
                 environment={"NPM_CONFIG_REGISTRY": settings.npm_registry_url,
                              "PIP_INDEX_URL": settings.pip_index_url},
@@ -143,6 +223,15 @@ async def _run_revision(run_id: str, context: dict, revision: str, probes: list)
             if code:
                 browser_error = f"Browser probe dependency unavailable: {output[-1000:]}"
             else:
+                # Repository installers can garbage-collect the image's browser cache.
+                # Verify/install the helper's own exact browser before network isolation.
+                code, output = await _command("docker", "exec", container, "node",
+                    "/tmp/ardberg-probe/node_modules/@playwright/test/cli.js", "install", "chromium", timeout=180)
+                path = write_artifact(run_id, f"{setup_prefix}/browser-install.log", output)
+                emit(run_id, "runtime", "artifact", agent="runner", node=f"{revision}_browser",
+                     detail={"path": path, "exit_code": code})
+                if code:
+                    browser_error = f"Browser helper executable unavailable; see {path}"
                 resource = Path(__file__).parent / "resources" / "runtime_probe.cjs"
                 code, output = await _command("docker", "cp", str(resource),
                                               f"{container}:/tmp/ardberg-runtime-probe.cjs",
@@ -175,13 +264,15 @@ async def _run_revision(run_id: str, context: dict, revision: str, probes: list)
         else:
             password = None
         environment = _test_environment(analysis, password)
-        for index, command in enumerate(
-            command for service in services for command in service.get("setup_commands", [])
-        ):
+        setup_commands = list(dict.fromkeys([
+            *(command for service in services for command in service.get("setup_commands", [])),
+            *runtime_fixtures,
+        ]))
+        for index, command in enumerate(setup_commands):
             await _run_setup_with_repair(
                 run_id, stage="runtime", agent="runner", node=f"{revision}_service_{index + 1}",
                 container=container, command=command,
-                log_prefix=f"review/runtime/{revision}/service-{index + 1}",
+                log_prefix=f"{setup_prefix}/service-{index + 1}",
                 workspace=source, environment=environment, network_isolated=True,
                 instruction=context.get("instruction", ""),
             )
@@ -192,44 +283,20 @@ async def _run_revision(run_id: str, context: dict, revision: str, probes: list)
                  analysis.get("app_ready_url") or "").strip()
         origin = ""
         app_error = ""
-        if needs_app:
-            parsed = urlsplit(ready)
-            if not start or parsed.scheme not in {"http", "https"} or parsed.hostname not in {
-                "localhost", "127.0.0.1", "0.0.0.0"
-            } or not parsed.port:
-                app_error = "No evidenced local start command and readiness URL"
-            else:
-                environment.update({"HOST": "0.0.0.0", "HOSTNAME": "0.0.0.0"})
-                code, output = await _command(
-                    "docker", "exec", "-d", *_environment_args(environment), container,
-                    "sh", "-lc", f"({start}) > /tmp/ardberg-app.log 2>&1", timeout=30,
-                )
-                if code:
-                    app_error = f"Application startup failed: {output}"
-                else:
-                    origin = f"{parsed.scheme}://127.0.0.1:{parsed.port}"
-                    ready_path = (parsed.path or "/") + (f"?{parsed.query}" if parsed.query else "")
-                    for _ in range(40):
-                        code, status = await _command("docker", "exec", container,
-                                                       "curl", "-sS", "-o", "/dev/null",
-                                                       "-w", "%{http_code}",
-                                                       origin + ready_path, timeout=10)
-                        response_code = int(status.strip()) if status.strip().isdigit() else 0
-                        if code == 0 and (200 <= response_code < 400 or response_code in {401, 403}):
-                            break
-                        await asyncio.sleep(1)
-                    else:
-                        code, log = await _command("docker", "exec", container, "cat",
-                                                   "/tmp/ardberg-app.log", timeout=20)
-                        path = write_artifact(run_id, f"review/runtime/{revision}/application.log", log)
-                        app_error = f"Application did not become ready; see {path}"
-                        origin = ""
-        emit(run_id, "runtime", "passed", agent="runner", node=f"{revision}_setup",
-             success=True, detail={"origin": origin, "app_error": app_error,
+        processes = analysis.get("runtime_processes", [])
+        if needs_app or processes:
+            if "runtime_processes" not in analysis and start and ready:
+                processes = [{"command": start, "ready_url": ready}]
+            environment.update({"HOST": "0.0.0.0", "HOSTNAME": "0.0.0.0"})
+            origin, app_error = await _start_processes(
+                run_id, container, revision, processes,
+                analysis.get("runtime_target_url") or ready, environment, setup_prefix)
+        emit(run_id, "runtime", "failed" if app_error else "passed", agent="runner", node=f"{revision}_setup",
+             success=not bool(app_error), detail={"origin": origin, "app_error": app_error,
                                    "browser_error": browser_error})
         for probe in probes:
             blocker = (browser_error if probe.kind == "browser" else "") or (
-                app_error if probe.kind in {"http", "browser"} else ""
+                app_error if probe.kind in {"http", "browser"} or processes else ""
             )
             if blocker:
                 detail = {"probe_id": probe.id, "expectation_id": probe.expectation_id,
@@ -251,12 +318,13 @@ async def _run_revision(run_id: str, context: dict, revision: str, probes: list)
     finally:
         if started:
             try:
-                code, log = await _command("docker", "exec", container, "cat",
-                                           "/tmp/ardberg-app.log", timeout=20)
-                if code == 0 and log.strip():
-                    path = write_artifact(run_id, f"review/runtime/{revision}/application.log", log)
-                    emit(run_id, "runtime", "artifact", agent="runner", node=f"{revision}_setup",
-                         detail={"path": path})
+                for index in range(len(processes)):
+                    code, log = await _command("docker", "exec", container, "cat",
+                                               f"/tmp/ardberg-app-{index}.log", timeout=20)
+                    if code == 0 and log.strip():
+                        path = write_artifact(run_id, f"{setup_prefix}/application-{index}.log", log)
+                        emit(run_id, "runtime", "artifact", agent="runner", node=f"{revision}_setup",
+                             detail={"path": path})
             except (OSError, TimeoutError):
                 pass
         if database_started:
@@ -277,10 +345,51 @@ async def _run_revision(run_id: str, context: dict, revision: str, probes: list)
 
 
 async def run_runtime_probes(run_id: str, context: dict, plan) -> dict:
-    base_probes = [item for item in plan.probes if item.compare_base]
-    base = await _run_revision(run_id, context, "base", base_probes)
-    head = await _run_revision(run_id, context, "head", plan.probes)
-    result = {"observations": base + head,
+    base, head = [], []
+    environments = {item.id: item for item in plan.environments}
+    inherited = {_setup_key(command) for command in context["analysis"].get("install_commands", [])}
+    equivalents, aliases = {}, {}
+    for item in plan.environments:
+        definition = item.model_dump(exclude={"id", "rationale", "evidence_paths"})
+        definition["setup_commands"] = [key for command in item.setup_commands
+                                        if (key := _setup_key(command)) not in inherited]
+        signature = json.dumps(definition, sort_keys=True)
+        aliases[item.id] = equivalents.setdefault(signature, item.id)
+    groups = {}
+    for probe in plan.probes:
+        # Older plans still isolate direct code calls from application setup.
+        key = probe.environment_id or ("code" if probe.kind == "script" else "application")
+        key = aliases.get(key, key)
+        groups.setdefault(key, []).append(probe)
+    for key, probes in groups.items():
+        analysis = dict(context["analysis"])
+        environment = environments.get(key)
+        if environment:
+            unused_keys = {k for s in analysis.get("services", []) if s["kind"] not in environment.services
+                           for k in s.get("connection_environment_keys", [])}
+            analysis.update({
+                "services": [s for s in analysis.get("services", []) if s["kind"] in environment.services],
+                "runtime_setup_commands": environment.setup_commands,
+                "runtime_processes": [p.model_dump() for p in environment.processes],
+                "runtime_target_url": environment.target_url,
+                "test_environment": [entry for entry in analysis.get("test_environment", [])
+                                     if entry["key"] not in unused_keys],
+            })
+        elif key == "code":
+            unused_keys = {k for s in analysis.get("services", []) for k in s.get("connection_environment_keys", [])}
+            analysis.update(services=[], runtime_processes=[], runtime_setup_commands=[],
+                            test_environment=[e for e in analysis.get("test_environment", []) if e["key"] not in unused_keys])
+        else:
+            analysis["runtime_setup_commands"] = analysis.get("interactive_preview_setup_commands", [])
+        scoped = {**context, "analysis": analysis, "runtime_environment_id": key}
+        head_result, base_result = await asyncio.gather(
+            _run_revision(run_id, scoped, "head", probes),
+            _run_revision(run_id, scoped, "base", [p for p in probes if p.compare_base]),
+        )
+        head.extend(head_result)
+        base.extend(base_result)
+    result = {"revision_pins": {"head_sha": context.get("head_sha"), "base_sha": context.get("base_sha")},
+              "observations": base + head,
               "probes_planned": len(plan.probes),
               "probes_observed": sum(item["status"] == "observed" for item in head),
               "probes_blocked": sum(item["status"] == "blocked" for item in head),

@@ -8,7 +8,7 @@ from temporalio.contrib.langgraph import graph
 
 with workflow.unsafe.imports_passed_through():
     from .artifacts import artifact_path, write_artifact
-    from .events import emit, get_events, set_run
+    from .events import emit, get_events, get_run, set_run
     from .inspection import prepare_run
     from .publication import publish_generated_tests
     from .report import generate_report, publish_report
@@ -27,6 +27,12 @@ def inferred_feature_unverified(context: dict, results: list[dict]) -> bool:
 @activity.defn
 async def preflight_activity(run_id: str) -> dict:
     try:
+        saved = get_run(run_id)
+        if saved["context"].get("resume_source_review"):
+            set_run(run_id, status="running", stage="review")
+            emit(run_id, "preflight", "passed", node="reuse_pinned_context", success=True,
+                 detail={"head_sha": saved["head_sha"], "base_sha": saved["base_sha"]})
+            return saved["context"]
         return await prepare_run(run_id)
     except Exception as exc:
         running = [item for item in get_events(run_id) if item["stage"] == "preflight"
@@ -53,7 +59,7 @@ async def commit_tests_activity(run_id: str, context: dict,
 @activity.defn
 async def report_activity(run_id: str, outcome: dict) -> str:
     set_run(run_id, stage="report")
-    if not artifact_path(run_id, "outcome.json").is_file():
+    if "manual_review" not in outcome or not artifact_path(run_id, "outcome.json").is_file():
         write_artifact(run_id, "outcome.json", json.dumps(outcome, indent=2))
     try:
         return await generate_report(run_id, outcome)

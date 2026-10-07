@@ -4,6 +4,18 @@ Ardberg is a local Next.js and Python application for reviewing GitHub pull requ
 
 The separate **Agent flow** tab is a read-only visual map inspired by n8n workflow canvases. Each run URL loads its own diagram and event history, labelled with its PR, run ID, and commit. New runs show expected-behavior extraction, code critique, runtime planning, disposable execution, evidence classification, and report stages. The overview lists recent manual and webhook runs. The **Interactive preview** tab lets a reviewer start the pinned application in a disposable local container, open it in a browser, inspect logs, and record hands-on observations.
 
+Runtime planning follows the requested behavior. Each probe selects an evidenced environment: isolated code, API plus disposable services, or browser plus the required application processes. Required processes have separate readiness checks; unrelated workers need not start. A failure in one environment leaves checks in other environments runnable. Repository migrations and seed commands run before dependent checks. Unsupported services or unavailable authentication fixtures remain explicit blockers. Python library setup includes documented build prerequisites; the runner executes the pinned source rather than replacing it with the published package.
+
+The planner handles at most three requirements per model request, with two requests in flight and a 210-second limit per batch. Equivalent environments are combined to avoid repeating dependency setup. A failed batch becomes an explicit coverage gap while successful batches continue. A run is limited to 12 focused probes; additional requirements remain unverified.
+
+New text artifacts and critique screenshots are also stored in the application database. Artifact downloads restore a missing local copy from that durable record. Relative `DATA_DIR` paths resolve from the project root so API and worker processes use the same location. Historical evidence lost before this storage change cannot be reconstructed; a historical report can still be restored from its run record. Reports include a deterministic execution record of observed, failed, and blocked probes and actual setup outcomes. Planning limitations must be reconciled with those outcomes.
+
+For a local review without GitHub checks, comments, or generated commits, uncheck **Publish results to GitHub** in the dashboard, or send `publish_to_github: false` with `POST /api/runs`. The report and evidence remain available in the dashboard. Omitting the field preserves normal GitHub publication. This option does not disable GitHub source retrieval or configured model analysis.
+
+After a finished critique encounters a setup or planning blocker, **Retry runtime review** reuses its pinned source, intent, source analysis, and saved probe plan. The API `POST /api/runs/{run_id}/retry-review` replans by default; `?replan_runtime=false` reuses the validated plan. Both paths repeat execution, evidence assessment, and reporting, preserve the publication policy, and save the previous report. Current results exclude superseded attempt failures. Start a new run to review a newer commit.
+
+Dependency setup is deduplicated across inherited and environment commands and runs before network isolation. Fixture setup runs after disposable services are ready. Head and base revisions use separate containers and can execute concurrently.
+
 ## Local setup
 
 Prerequisites: Python 3.11+, Node.js 20+, Docker Desktop with Linux containers, a GitHub App, and an OpenAI API key.
@@ -92,6 +104,7 @@ GitHub must be able to reach the webhook at /webhooks/github over public HTTPS. 
 - The optional PostgreSQL test image is configured by POSTGRES_TEST_IMAGE. When repository migrations require the `vector` extension, Ardberg selects the pgvector image configured by POSTGRES_VECTOR_IMAGE. Other external services need runner support before they can be used in a test run. The interactive preview prevents overrides of its generated disposable database connection variables.
 - Dependency installation uses the configured npm and Python indexes. Test processes run on a private Docker network after installation; install scripts still execute while the package source is reachable.
 - When an install or service setup command reports a missing prerequisite, the runner asks the repair agent for one safe installation command, runs it inside the disposable container, and retries the failed command. `SETUP_REPAIR_LIMIT` caps repairs per setup node at 2 by default (maximum 5). Attempt and repair logs are retained; an unresolved prerequisite fails that node. The same behavior applies to automated runs, baseline browser setup, database baseline installation, and interactive previews. For service setup after network isolation, network access is restored only during the repair command.
+- For historical Playwright Python wheels whose driver ZIP has disappeared, a bounded adapter reconstructs that exact driver dependency from its npm version and the original Node version in the matching upstream build script. Both downloads are integrity checked; provenance is retained and reviewed Python source stays unchanged. This follows the layout of [Playwright's driver assembler](https://github.com/microsoft/playwright-python/blob/main/scripts/build_driver.py). If an old `--with-deps` command fails on APT capability restrictions, the runner retries browser installation using its image's existing OS libraries. A missing library at actual browser launch remains a blocker.
 - The first version supports GitHub.com URLs. A user-selected fallback specialist with no executable target or adapter fails its branch while other branches continue. An automatically evaluated specialist with no executable target records a skipped branch.
 - The Temporal LangGraph integration is in Public Preview. Keep compatible dependency versions pinned during deployment and verify replay and branch completion in your environment.
 - Interactive previews run repository code with local browser access and retain network access for dependency installation and application use. Run them only for repositories you trust to execute on your machine. The preview container receives only repository-derived test environment values, never Ardberg credentials.
@@ -101,6 +114,8 @@ GitHub must be able to reach the webhook at /webhooks/github over public HTTPS. 
 - A security scan with no finding proves only that its selected checks found none. Repositories without a declared scanner receive a coverage gap, and static model concerns remain potential until tested.
 
 ## Verification commands
+
+Backend tests use a temporary database and artifact directory, independent of live reviews. To exercise the real Docker runner, run `tests/manual_runtime_review_smoke.py` from `backend` with `PYTHONPATH` set to that directory. It checks direct code execution, base comparison, two separately started processes, HTTP, a browser interaction, declared PostgreSQL fixtures, and screenshot recovery from the database.
 
 ~~~powershell
 cd backend

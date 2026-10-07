@@ -66,8 +66,10 @@ export const api = {
   preview: (repository: string, pr_number: number) => request<RepoPreview>("/api/preview", {
     method: "POST", body: JSON.stringify({ repository, pr_number }),
   }),
-  createRun: (input: { repository: string; pr_number: number; instruction: string; selected_frameworks: string[]; mode?: "critique" | "testing" }) =>
+  createRun: (input: { repository: string; pr_number: number; instruction: string; selected_frameworks: string[]; mode?: "critique" | "testing"; publish_to_github?: boolean }) =>
     request<{ run_id: string }>("/api/runs", { method: "POST", body: JSON.stringify(input) }),
+  retryReview: (id: string, replan: boolean) => request<{ run_id: string }>(
+    `/api/runs/${id}/retry-review?replan_runtime=${replan}`, { method: "POST" }),
   runs: () => request<RunSummary[]>("/api/runs"),
   run: (id: string) => request<Run>(`/api/runs/${id}`),
   events: (id: string) => request<RunEvent[]>(`/api/runs/${id}/events`),

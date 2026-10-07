@@ -10,6 +10,10 @@ from .models import Run
 
 async def publish_generated_tests(run_id: str, context: dict,
                                   agent_results: list[dict]) -> dict:
+    if context.get("publish_to_github") is False:
+        emit(run_id, "publication", "not_selected", agent="executor", node="commit_tests",
+             detail={"committed": False, "reason": "Local review: GitHub publication disabled"})
+        return {"success": True, "committed": False, "files": []}
     emit(run_id, "publication", "running", agent="executor", node="commit_tests")
     try:
         workspace = (run_dir(run_id) / "workspace").resolve()

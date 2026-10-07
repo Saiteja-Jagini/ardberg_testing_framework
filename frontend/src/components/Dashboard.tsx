@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { Activity, ArrowRight, Bot, CircleCheck, CircleHelp, CircleX, ExternalLink, GitBranch, GitPullRequest, Github, LayoutDashboard, LoaderCircle, Play, Plus, RefreshCw, Workflow, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -61,6 +62,7 @@ export default function Dashboard({ initialRunId }: { initialRunId?: string }) {
   const [url, setUrl] = useState("");
   const [instruction, setInstruction] = useState("");
   const [testingMode, setTestingMode] = useState(false);
+  const [publishToGithub, setPublishToGithub] = useState(true);
   const [resolved, setResolved] = useState<ResolvedRepo | null>(null);
   const [selectedPr, setSelectedPr] = useState<PullRequest | null>(null);
   const [run, setRun] = useState<Run | null>(null);
@@ -116,17 +118,36 @@ export default function Dashboard({ initialRunId }: { initialRunId?: string }) {
   }, [initialRunId]);
 
   useEffect(() => {
-    if (!initialRunId || run?.status === "completed" || run?.status === "failed") return;
+    if (!initialRunId || run?.id !== initialRunId || run?.status === "completed" || run?.status === "failed") return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let refreshing = false;
+    let pending = false;
+    let disposed = false;
+    function queueRefresh() {
+      pending = true;
+      if (timer || refreshing || disposed) return;
+      timer = setTimeout(async () => {
+        timer = undefined;
+        if (disposed) return;
+        pending = false;
+        refreshing = true;
+        try { await refresh(); } catch { /* The next event can retry a transient read failure. */ }
+        finally {
+          refreshing = false;
+          if (pending && !disposed) queueRefresh();
+        }
+      }, 250);
+    }
     const source = new EventSource(API_URL + "/api/runs/" + initialRunId + "/stream?after=" + eventCursor.current);
     source.addEventListener("node", (message) => {
       const id = Number((message as MessageEvent).lastEventId);
       if (Number.isFinite(id)) eventCursor.current = Math.max(eventCursor.current, id);
-      refresh().catch(() => {});
+      queueRefresh();
     });
-    source.addEventListener("done", () => { refresh().catch(() => {}); source.close(); });
+    source.addEventListener("done", () => { queueRefresh(); source.close(); });
     // EventSource reconnects automatically and sends its last event ID.
-    return () => source.close();
-  }, [initialRunId, refresh, run?.status]);
+    return () => { disposed = true; if (timer) clearTimeout(timer); source.close(); };
+  }, [initialRunId, refresh, run?.id, run?.status]);
 
   useEffect(() => {
     if (!initialRunId || tab !== "interactive") return;
@@ -157,7 +178,7 @@ export default function Dashboard({ initialRunId }: { initialRunId?: string }) {
     try {
       const result = await api.createRun({ repository: resolved.repository, pr_number: selectedPr.number,
         instruction: instruction.trim(), selected_frameworks: [],
-        mode: testingMode ? "testing" : "critique" });
+        mode: testingMode ? "testing" : "critique", publish_to_github: publishToGithub });
       router.push("/runs/" + result.run_id);
     } catch (err) { setError(err instanceof Error ? err.message : "Could not start run"); }
     finally { setBusy(false); }
@@ -165,17 +186,29 @@ export default function Dashboard({ initialRunId }: { initialRunId?: string }) {
 
   function newRun() {
     if (initialRunId) { router.push("/"); return; }
-    setUrl(""); setInstruction(""); setTestingMode(false);
+    setUrl(""); setInstruction(""); setTestingMode(false); setPublishToGithub(true);
     setResolved(null); setSelectedPr(null);
     setError(""); setInstallUrl("");
+  }
+
+  async function retryReview() {
+    if (!run) return;
+    setBusy(true); setError("");
+    try {
+      await api.retryReview(run.id, !artifacts.includes("review/runtime-plan.json"));
+      await refresh();
+    } catch (err) { setError(err instanceof Error ? err.message : "Could not retry review"); }
+    finally { setBusy(false); }
   }
 
   const isCritique = !run || run.context?.mode === "critique";
   const names = isCritique ? reviewAgentNames : agentNames;
   const descriptions = isCritique ? reviewAgentDescriptions : agentDescriptions;
   const agentEvents = Object.keys(names).map(key => ({ key, current: latestFor(events, key) }));
-  const passed = events.filter(event => event.status === "passed" && event.node).length;
-  const failed = events.filter(event => event.status === "failed" && event.node).length;
+  const retryIndex = events.map(event => event.node).lastIndexOf("reuse_pinned_context");
+  const currentEvents = retryIndex < 0 ? events : events.slice(retryIndex);
+  const passed = currentEvents.filter(event => event.status === "passed" && event.node).length;
+  const failed = currentEvents.filter(event => event.status === "failed" && event.node).length;
   const artifacts = [...new Set(events.flatMap(event => {
     const detail = event.detail;
     return [detail.path, detail.log, detail.screenshot,
@@ -217,6 +250,7 @@ export default function Dashboard({ initialRunId }: { initialRunId?: string }) {
             <Textarea id="instruction" value={instruction} onChange={event => setInstruction(event.target.value)} placeholder="For the login form, wrong passwords must show an error without creating a session. Valid credentials must open the dashboard." rows={7} />
             <div className="helper-row"><CircleHelp size={14} /> Ardberg compares the diff with expected behavior and exercises focused scenarios in a disposable container. Unclear requirements remain explicitly unverified.</div>
             <label className="helper-row"><input type="checkbox" checked={testingMode} onChange={event => setTestingMode(event.target.checked)} /> Run the legacy generated test and commit workflow instead (optional)</label>
+            <label className="helper-row"><input type="checkbox" checked={publishToGithub} onChange={event => setPublishToGithub(event.target.checked)} /> Publish results to GitHub. Uncheck to keep reports and generated tests in this workspace.</label>
             <Button className="primary-button" disabled={busy || !selectedPr} onClick={startRun}><Play size={16} fill="currentColor" /> Start PR review <ArrowRight size={17} /></Button>
           </Card>
         </div>
@@ -226,10 +260,14 @@ export default function Dashboard({ initialRunId }: { initialRunId?: string }) {
         </Card>}</> :
         <><Card className="run-hero panel"><div className="run-hero-main"><span className="run-label"><GitPullRequest size={15} /> {run.repository} · PR #{run.pr_number}</span><h2>{run.title}</h2><div className="run-meta"><span><GitBranch size={14} /> {run.head_sha.slice(0, 12)}</span><Badge variant="outline" className={["status-badge", run.status].join(" ")}>{run.status}</Badge><span>Stage: {run.stage}</span></div></div><Button variant="outline" className="outline-button" onClick={() => refresh().catch(err => setError(err.message))}><RefreshCw size={15} /> Refresh</Button></Card>
           <ReviewScope run={run} />
+          <div className="mb-4 flex flex-wrap items-center gap-3">
+            {run.context?.publish_to_github === false && <Badge variant="outline">Local report</Badge>}
+            {isCritique && ["completed", "failed"].includes(run.status) && <Button variant="outline" disabled={busy} onClick={retryReview} title="Reuse the pinned source and available probe plan, then run the review again"><RefreshCw size={15} className={busy ? "spin" : ""} /> Retry runtime review</Button>}
+          </div>
           <div className="stats-row"><Card className="stat-card"><span>AGENTS</span><strong>{agentEvents.filter(item => item.current).length}<small> / {agentEvents.length}</small></strong><p>with activity</p></Card><Card className="stat-card"><span>PASSED NODES</span><strong>{passed}</strong><p>completed successfully</p></Card><Card className="stat-card"><span>FAILED NODES</span><strong>{failed}</strong><p>inspect evidence</p></Card><Card className="stat-card"><span>CURRENT STAGE</span><strong className="stage-value">{run.stage}</strong><p>{run.status}</p></Card></div>
           <div className="run-grid"><Card className="panel agent-panel"><div className="section-header"><div><div className="eyebrow">REVIEW STAGES</div><h2>{isCritique ? "Review agents" : "Testing agents"}</h2></div><Button variant="ghost" className="text-button" onClick={() => setTab("flow")}>Open flow <ArrowRight size={15} /></Button></div>{agentEvents.map(item => <div className="agent-row" key={item.key}><div className={["agent-symbol", item.key].join(" ")}>{item.key === "builtin" ? <GitBranch size={18} /> : names[item.key].slice(0, 1)}</div><div className="agent-copy"><strong>{names[item.key]}</strong><small>{item.current ? (item.current.node?.replaceAll("_", " ") ?? "") + " · " + item.current.status : descriptions[item.key]}</small></div><Badge variant="outline" className={["status-badge", item.current?.status ?? "not_started"].join(" ")}>{item.current?.status ?? "waiting"}</Badge></div>)}</Card>
           <Card className="panel activity-panel"><div className="section-header"><div><div className="eyebrow">RUN ACTIVITY</div><h2>Latest events</h2></div><Activity size={18} /></div><ScrollArea className="activity-list max-h-[340px]">{events.slice(-8).reverse().map(event => <div className="activity-row" key={event.id}><span className={["activity-dot", event.status].join(" ")} /><div><strong>{event.node?.replaceAll("_", " ") ?? event.stage}</strong><small>{event.agent ?? "supervisor"} · {event.status}</small></div><time>{new Date(event.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time></div>)}{events.length === 0 && <div className="empty-state">Waiting for the first node event…</div>}</ScrollArea></Card></div>
-          <Card className="panel results-panel"><div className="section-header"><div><div className="eyebrow">EVIDENCE & REVIEW</div><h2>Agent report</h2></div><Badge variant="outline" className={["status-badge", run.report ? "passed" : "not_started"].join(" ")}>{run.report ? "ready" : "pending"}</Badge></div>{run.report ? <ScrollArea className="report-scroll h-[min(680px,70vh)] w-full min-w-0 max-w-full"><article className="report-markdown"><ReactMarkdown components={{ a: ({ href, children }) => { const url = reportHref(href, run.id); return url ? <a href={url} target="_blank" rel="noreferrer">{children}</a> : <span>{children}</span>; } }}>{run.report}</ReactMarkdown></article></ScrollArea> : <div className="empty-state"><LoaderCircle size={21} className={run.status === "running" ? "spin" : ""} /> The report appears here when the evidence review finishes.</div>}{run.error && <Alert variant="destructive"><AlertDescription>{run.error}</AlertDescription></Alert>}{artifacts.length > 0 && <div className="artifacts" id="artifacts"><div className="eyebrow">RUN ARTIFACTS</div><ScrollArea className="max-h-52"><div className="artifact-list">{artifacts.map(path => <a key={path} href={API_URL + "/api/runs/" + run.id + "/artifacts/" + path} target="_blank" rel="noreferrer"><span>{path}</span><ExternalLink size={13} /></a>)}</div></ScrollArea></div>}</Card>
+          <Card className="panel results-panel"><div className="section-header"><div><div className="eyebrow">EVIDENCE & REVIEW</div><h2>Agent report</h2></div><Badge variant="outline" className={["status-badge", run.report ? "passed" : "not_started"].join(" ")}>{run.report ? "ready" : "pending"}</Badge></div>{run.report ? <ScrollArea className="report-scroll h-[min(680px,70vh)] w-full min-w-0 max-w-full"><article className="report-markdown"><ReactMarkdown remarkPlugins={[remarkGfm]} components={{ a: ({ href, children }) => { const url = reportHref(href, run.id); return url ? <a href={url} target="_blank" rel="noreferrer">{children}</a> : <span>{children}</span>; } }}>{run.report}</ReactMarkdown></article></ScrollArea> : <div className="empty-state"><LoaderCircle size={21} className={run.status === "running" ? "spin" : ""} /> The report appears here when the evidence review finishes.</div>}{run.error && <Alert variant="destructive"><AlertDescription>{run.error}</AlertDescription></Alert>}{artifacts.length > 0 && <div className="artifacts" id="artifacts"><div className="eyebrow">RUN ARTIFACTS</div><ScrollArea className="max-h-52"><div className="artifact-list">{artifacts.map(path => <a key={path} href={API_URL + "/api/runs/" + run.id + "/artifacts/" + path} target="_blank" rel="noreferrer"><span>{path}</span><ExternalLink size={13} /></a>)}</div></ScrollArea></div>}</Card>
         </>}
       </div>}
       <footer className="footer mx-auto w-full max-w-[1330px] px-6 pb-5"><Separator className="mb-4" /><span>Ardberg · Pinned diff review · Disposable runtime evidence</span></footer>

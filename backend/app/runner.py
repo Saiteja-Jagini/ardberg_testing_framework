@@ -1,4 +1,5 @@
 import asyncio
+import ast
 import json
 import hashlib
 import os
@@ -162,6 +163,26 @@ def _repair_command_allowed(command: str, failed_command: str, workspace: Path,
     return False
 
 
+def _legacy_driver_version(workspace: Path, command: str, output: str) -> str | None:
+    """Recognize only the pinned Playwright Python wheel's retired ZIP dependency."""
+    if ("BadZipFile" not in output or not re.search(r"(?:-m\s+build|setup\.py\s+bdist_wheel)", command)
+            or "playwright" not in _local_package_names(workspace)):
+        return None
+    setup = workspace / "setup.py"
+    if not setup.is_file() or setup.is_symlink():
+        return None
+    try:
+        tree = ast.parse(setup.read_text(encoding="utf-8"))
+        for item in tree.body:
+            if (isinstance(item, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "driver_version" for t in item.targets)
+                    and isinstance(item.value, ast.Constant) and isinstance(item.value.value, str)
+                    and re.fullmatch(r"\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?", item.value.value)):
+                return item.value.value
+    except (OSError, SyntaxError, UnicodeError):
+        return None
+    return None
+
+
 async def _run_setup_with_repair(run_id: str, *, stage: str, agent: str, node: str,
                                  container: str, command: str, log_prefix: str,
                                  workspace: Path, cwd: str = "/workspace",
@@ -195,6 +216,8 @@ async def _run_setup_with_repair(run_id: str, *, stage: str, agent: str, node: s
     failed_command = command
     failure_reason = ""
     repair_history = []
+    driver_rebuilt = False
+    browser_mirror_used = False
     output = ""
     try:
         code, output = await execute(command)
@@ -212,6 +235,64 @@ async def _run_setup_with_repair(run_id: str, *, stage: str, agent: str, node: s
             if repairs >= limit:
                 failure_reason = f"Dependency repair limit ({limit}) reached"
                 break
+            if ("--with-deps" in command and "playwright install" in command and
+                    any(marker in output for marker in ("setgroups", "setegid", "seteuid"))):
+                # The runner image already supplies browser OS libraries. Do not grant
+                # extra capabilities just so an old installer can repeat apt setup.
+                repairs += 1
+                command = command.replace("--with-deps", "").strip()
+                failed_command = command
+                emit(run_id, stage, "running", agent=agent, node=node,
+                     detail={"repair_attempt": repairs, "command": command,
+                             "reason": "Use runner-image OS libraries; install exact browser revision without privileged apt setup"})
+                code, output = await execute(command, repair=True)
+                attempt += 1
+                continue
+            driver_version = _legacy_driver_version(workspace, failed_command, output)
+            if driver_version and not driver_rebuilt:
+                driver_rebuilt = True
+                repairs += 1
+                resource = Path(__file__).parent / "resources" / "assemble_legacy_driver.py"
+                copied, copy_output = await _command("docker", "cp", str(resource),
+                    f"{container}:/tmp/ardberg-assemble-driver.py", timeout=30)
+                if copied:
+                    failure_reason = f"Could not install dependency recovery helper: {copy_output}"
+                    break
+                emit(run_id, stage, "running", agent=agent, node=node,
+                     detail={"repair_attempt": repairs, "driver_version": driver_version,
+                             "reason": "Reconstruct retired driver archive using exact npm and upstream Node pins"})
+                repair_code, repair_output = await execute(f"python /tmp/ardberg-assemble-driver.py {driver_version}", repair=True)
+                repair_path = write_artifact(run_id, f"{log_prefix}-driver-recovery.log", repair_output)
+                emit(run_id, stage, "artifact", agent=agent, node=node, detail={"path": repair_path})
+                if repair_code:
+                    failure_reason = f"Pinned driver reconstruction failed; see {repair_path}"
+                    break
+                # Retain the validated build dependency outside disposable containers.
+                provenance = json.loads(repair_output.strip().splitlines()[-1])
+                cache = settings.data_dir / "runtime-cache" / "playwright-drivers"
+                cache.mkdir(parents=True, exist_ok=True)
+                name = Path(provenance["archive"]).name
+                if not re.fullmatch(r"playwright-[A-Za-z0-9.-]+-linux(?:-arm64)?\.zip", name):
+                    raise ValueError("Unexpected reconstructed driver archive")
+                cached, _ = await _command("docker", "cp", f"{container}:{cwd}/{provenance['archive']}", str(cache / name), timeout=60)
+                if cached == 0 and hashlib.sha256((cache / name).read_bytes()).hexdigest() == provenance["archive_sha256"]:
+                    (cache / (name + ".json")).write_text(json.dumps(provenance), encoding="utf-8")
+                code, output = await execute(command)
+                failed_command = command
+                attempt += 1
+                continue
+            if (not browser_mirror_used and "playwright install" in command
+                    and "Failed to download" in output and "azureedge.net" in output):
+                browser_mirror_used = True
+                repairs += 1
+                environment["PLAYWRIGHT_DOWNLOAD_HOST"] = "https://cdn.playwright.dev/dbazure/download/playwright"
+                emit(run_id, stage, "running", agent=agent, node=node,
+                     detail={"repair_attempt": repairs, "reason": "Retry exact browser revision on official CDN mirror",
+                             "download_host": environment["PLAYWRIGHT_DOWNLOAD_HOST"]})
+                code, output = await execute(command, repair=True)
+                failed_command = command
+                attempt += 1
+                continue
             try:
                 proposal = await parse(REPAIR_PROMPT, {
                     "failed_command": failed_command, "original_command": command,

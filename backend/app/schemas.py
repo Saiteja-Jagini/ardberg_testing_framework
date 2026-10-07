@@ -17,6 +17,7 @@ class CreateRunRequest(BaseModel):
     instruction: str = Field(default="", max_length=12000)
     selected_frameworks: list[Literal["playwright", "vitest"]] = Field(default_factory=list)
     mode: Literal["critique", "testing"] = "critique"
+    publish_to_github: bool = True
 
     @field_validator("instruction")
     @classmethod

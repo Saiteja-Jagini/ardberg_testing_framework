@@ -7,6 +7,31 @@ from app import runner
 from app.schemas import DependencyRepair
 
 
+def test_retired_driver_recovery_requires_exact_repository_pin(tmp_path):
+    (tmp_path / "pyproject.toml").write_text('[project]\nname="playwright"\n')
+    (tmp_path / "setup.py").write_text('driver_version = "1.49.0-beta-1732210972000"\n')
+    assert runner._legacy_driver_version(tmp_path, "python -m build --wheel", "zipfile.BadZipFile") == "1.49.0-beta-1732210972000"
+    assert runner._legacy_driver_version(tmp_path, "pytest", "zipfile.BadZipFile") is None
+    assert runner._legacy_driver_version(tmp_path, "python -m build --wheel", "assertion failed") is None
+    (tmp_path / "setup.py").write_text('driver_version = compute_version()\n')
+    assert runner._legacy_driver_version(tmp_path, "python -m build --wheel", "zipfile.BadZipFile") is None
+
+
+def test_browser_install_reuses_image_libraries_after_apt_permission_failure(monkeypatch, tmp_path):
+    events, logs = _capture(monkeypatch)
+    commands = []
+    async def command(*args, **kwargs):
+        commands.append(args[-1])
+        return (1, "setgroups failed: Operation not permitted") if "--with-deps" in args[-1] else (0, "Chromium installed")
+    async def no_model(*args, **kwargs):
+        pytest.fail("Known runner capability restriction should not need model diagnosis")
+    monkeypatch.setattr(runner, "_command", command)
+    monkeypatch.setattr(runner, "parse", no_model)
+    _run(tmp_path)
+    assert "--with-deps" in commands[0] and "--with-deps" not in commands[-1]
+    assert any(kwargs.get("success") is True for _, kwargs in events)
+
+
 def _capture(monkeypatch, *, limit=2):
     events = []
     logs = {}

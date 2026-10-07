@@ -374,7 +374,7 @@ def test_api_and_webhook_accept_saved_blank_testing_intent(monkeypatch):
             return {"id": 17}
 
     async def fake_start(repo, number, instruction, selected, installation,
-                         expected_head=None, mode="critique"):
+                         expected_head=None, mode="critique", publish_to_github=True):
         captured.append((repo, number, instruction, selected, installation, expected_head))
         return str(uuid4())
 

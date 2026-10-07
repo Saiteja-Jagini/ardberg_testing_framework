@@ -4,13 +4,19 @@ import os
 from dotenv import load_dotenv
 
 
-load_dotenv(Path(__file__).resolve().parents[2] / ".env")
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+load_dotenv(PROJECT_ROOT / ".env")
+
+
+def _data_directory() -> Path:
+    value = Path(os.getenv("DATA_DIR", str(PROJECT_ROOT / ".data")))
+    return (value if value.is_absolute() else PROJECT_ROOT / value).resolve()
 
 
 @dataclass(frozen=True)
 class Settings:
     database_url: str = os.getenv("DATABASE_URL", f"sqlite:///{Path(__file__).resolve().parents[2] / '.data' / 'ardberg.db'}")
-    data_dir: Path = Path(os.getenv("DATA_DIR", str(Path(__file__).resolve().parents[2] / ".data"))).resolve()
+    data_dir: Path = _data_directory()
     github_app_id: str = os.getenv("GITHUB_APP_ID", "")
     github_app_slug: str = os.getenv("GITHUB_APP_SLUG", "")
     github_private_key: str = os.getenv("GITHUB_PRIVATE_KEY", "").replace("\\n", "\n")

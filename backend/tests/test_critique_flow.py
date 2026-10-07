@@ -36,6 +36,12 @@ def test_new_api_runs_start_critique_workflow(monkeypatch):
                                     "Find missing behavior", [], 1))
     assert started[0][0] == ReviewWorkflow.run
     assert get_run(run_id)["context"]["mode"] == "critique"
+    async def forbidden_check(*_args):
+        raise AssertionError("Local review must not create a remote check")
+    monkeypatch.setattr(FakeGitHub, "create_check", forbidden_check)
+    local_run = asyncio.run(_start_run("local/critique-workflow", 2, "Inspect", [], 1,
+                                       publish_to_github=False))
+    assert get_run(local_run)["context"]["publish_to_github"] is False
 
 
 def test_source_review_includes_likely_caller_and_relevant_documentation(tmp_path: Path):
