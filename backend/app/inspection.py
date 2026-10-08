@@ -6,7 +6,7 @@ import shutil
 from uuid import uuid4
 from sqlalchemy import select
 
-from .artifacts import run_dir, write_artifact
+from .artifacts import run_dir, restore_artifact, write_artifact
 from .contracts import compare_openapi
 from .db import session_scope
 from .events import emit, get_run, set_run
@@ -305,8 +305,8 @@ async def analyze_repository(repository: str, changed: list[dict], source: Path,
         "Do not invent a command absent from the repository conventions unless setup requires it."
         + (" This is a code-critique run. Prioritize the complete application or changed "
            "library runtime, start/readiness commands, and disposable service setup even when "
-           "there is no native test framework. Existing test-suite commands are background "
-           "context and will not be run by this workflow." if review_mode else ""),
+           "there is no native test framework. Baseline repository checks execute separately "
+           "from focused behavior probes." if review_mode else ""),
         {"repository": repository, "files": files[:2500],
          "snippets": snippets, "changed_files": compact_changes(changed)[:100],
          "instruction": instruction}, FrameworkAnalysis,
@@ -422,7 +422,7 @@ async def resolve_review_intent(instruction: str, *, title: str, description: st
     return fallback, assessment, "automatic_fallback", "Feature intent remains unverified: " + reason
 
 
-async def prepare_run(run_id: str) -> dict:
+async def prepare_run(run_id: str, *, pinned_only: bool = False) -> dict:
     run = get_run(run_id)
     review_mode = (run.get("context") or {}).get("mode") == "critique"
     emit(run_id, "preflight", "running", node="fetch_repository")
@@ -476,8 +476,29 @@ async def prepare_run(run_id: str) -> dict:
                      "base_source_error": base_source_error,
                      "pr_description": (pr.get("body") or "")[:6000],
                      "commits": commits[:100], "commits_truncated": commits_truncated,
-                     "diff_artifact": diff_artifact},
+                     "commits_error": commits_error, "diff_artifact": diff_artifact},
             status="running", stage="preflight")
+
+    pinned = get_run(run_id)["context"]
+    if pinned_only:
+        return {**pinned, "needs_preflight_analysis": True}
+    return await finish_preflight(run_id, pinned)
+
+
+async def finish_preflight(run_id: str, pinned: dict) -> dict:
+    """Model-dependent inspection; baseline setup never waits for this function."""
+    run = get_run(run_id)
+    review_mode = pinned.get("mode") == "critique"
+    pr = {"title": run["title"], "body": pinned.get("pr_description", "")}
+    head_sha, base_sha = pinned["head_sha"], pinned["base_sha"]
+    source = Path(pinned["source_path"])
+    base_source = Path(pinned["base_source_path"]) if pinned.get("base_source_path") else None
+    base_source_error = pinned.get("base_source_error", "")
+    diff_artifact = pinned["diff_artifact"]
+    changed = json.loads(restore_artifact(run_id, diff_artifact).read_text(encoding="utf-8"))
+    commits, commits_truncated = pinned.get("commits", []), pinned.get("commits_truncated", False)
+    commits_error = pinned.get("commits_error", "")
+    partial_files, partial_snippets = pinned["files"], pinned["snippets"]
 
     emit(run_id, "preflight", "running", node="validate_instruction")
     try:

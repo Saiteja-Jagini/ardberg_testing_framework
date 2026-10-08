@@ -11,7 +11,7 @@ from .interactive_preview import (
 )
 from .workflow import (
     AgentWorkflow, ManualReportWorkflow, ReviewWorkflow, RunWorkflow, commit_tests_activity, execute_activity, preflight_activity,
-    review_activity,
+    review_activity, pin_review_activity,
     publish_activity, report_activity, status_activity,
 )
 
@@ -23,7 +23,7 @@ async def main():
     worker = Worker(
         client, task_queue=settings.temporal_task_queue,
         workflows=[RunWorkflow, ReviewWorkflow, AgentWorkflow, PreviewWorkflow, ManualReportWorkflow],
-        activities=[preflight_activity, execute_activity, commit_tests_activity, report_activity,
+        activities=[preflight_activity, pin_review_activity, execute_activity, commit_tests_activity, report_activity,
                     review_activity, publish_activity, status_activity, launch_preview_activity,
                     stop_preview_activity, preview_health_activity],
         plugins=[plugin],

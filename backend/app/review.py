@@ -475,7 +475,7 @@ async def _plan_runtime(run_id: str, prompt: str, common: dict, behaviors: Behav
     return merged
 
 
-async def run_review(run_id: str, context: dict) -> dict:
+async def run_review(run_id: str, context: dict, prepared=None) -> dict:
     changed, diff_gaps = _pinned_changes(run_id, context)
     source, source_gaps = _source_evidence(context, changed)
     source_gaps.extend(diff_gaps)
@@ -598,7 +598,12 @@ async def run_review(run_id: str, context: dict) -> dict:
                                json.dumps(plan.model_dump(), indent=2))
     emit(run_id, "review", "artifact", agent="runtime_planner", node="analyze",
          detail={"path": plan_path, "probes": len(plan.probes)})
-    runtime = await run_runtime_probes(run_id, context, plan)
+    baseline_state = await prepared if prepared is not None else None
+    runtime = (await run_runtime_probes(run_id, context, plan, prepared=baseline_state)
+               if baseline_state is not None else await run_runtime_probes(run_id, context, plan))
+    if baseline_state is not None:
+        runtime["baseline"] = baseline_state["baseline"]
+        write_artifact(run_id, "review/runtime-observations.json", json.dumps(runtime, indent=2))
 
     judgment = await _agent(
         run_id, "evidence_critic", "Write a critique of the PR using expectations, per-behavior "
@@ -737,7 +742,12 @@ async def run_review(run_id: str, context: dict) -> dict:
             f"{len(valid_findings)} concern(s) remain potential or unverified; "
             "see their code and runtime evidence below."
         )
-    uncertain = (not behaviors.expectations or bool(judgment.unverified) or
+    baseline = runtime.get("baseline", {})
+    baseline_uncertain = bool(baseline) and (baseline.get("status") != "passed" or
+                         bool(baseline.get("gaps")) or
+                         any(c["status"] != "passed" for c in baseline.get("checks", [])))
+    native_failed = any(c["status"] == "failed" for c in baseline.get("checks", []))
+    uncertain = (baseline_uncertain or not behaviors.expectations or bool(judgment.unverified) or
                  any(item.status != "implemented" for item in critique.assessments) or
                  runtime["probes_blocked"] > 0 or runtime.get("probes_failed", 0) > 0 or
                  runtime.get("base_probes_unavailable", 0) > 0 or
@@ -756,6 +766,6 @@ async def run_review(run_id: str, context: dict) -> dict:
             "runtime_plan": plan.model_dump(), "runtime": runtime,
             "judgment": judgment.model_dump(),
             "verdict": verdict,
-            "check_conclusion": "failure" if confirmed_count else "neutral" if uncertain else "success",
+            "check_conclusion": "failure" if confirmed_count or native_failed else "neutral" if uncertain else "success",
             "check_success": not confirmed_count and not uncertain,
             "artifacts": [behavior_path, critique_path, plan_path, finding_path]}

@@ -5,6 +5,7 @@ import json
 import os
 import secrets
 import shlex
+from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import urlsplit
 from uuid import uuid4
@@ -54,17 +55,24 @@ async def _start_processes(run_id: str, container: str, revision: str,
                            processes: list[dict], target_url: str,
                            environment: dict[str, str], prefix: str) -> tuple[str, str]:
     """Start only required processes and verify each endpoint before dependent probes."""
+    errors = []
+    def failed(index, process, error):
+        errors.append(error)
+        emit(run_id, "runtime", "failed", agent="runner", node=f"{revision}_ready_{index}",
+             success=False, detail={"command": process["command"], "ready_url": process["ready_url"], "error": error})
     for index, process in enumerate(processes):
         parsed = urlsplit(process["ready_url"])
         if (parsed.scheme not in {"http", "https"} or parsed.hostname not in
                 {"localhost", "127.0.0.1", "0.0.0.0"} or not parsed.port):
-            return "", "No evidenced local start command and readiness URL"
+            failed(index, process, "No evidenced local start command and readiness URL")
+            continue
         log_file = f"/tmp/ardberg-app-{index}.log"
         code, output = await _command(
             "docker", "exec", "-d", *_environment_args(environment), container,
             "sh", "-lc", f"({process['command']}) > {log_file} 2>&1", timeout=30)
         if code:
-            return "", f"Application startup failed: {output}"
+            failed(index, process, f"Application startup failed: {output}")
+            continue
         ready = f"{parsed.scheme}://127.0.0.1:{parsed.port}{parsed.path or '/'}"
         if parsed.query:
             ready += "?" + parsed.query
@@ -83,7 +91,9 @@ async def _start_processes(run_id: str, container: str, revision: str,
         else:
             _, log = await _command("docker", "exec", container, "cat", log_file, timeout=20)
             path = write_artifact(run_id, f"{prefix}/application-{index}.log", log)
-            return "", f"Application did not become ready; see {path}"
+            failed(index, process, f"Application did not become ready; see {path}")
+    if errors:
+        return "", "; ".join(errors)
     parsed = urlsplit(target_url)
     if not processes or not parsed.port or parsed.hostname not in {"localhost", "127.0.0.1", "0.0.0.0"}:
         return "", "No evidenced application process and target URL"
@@ -164,157 +174,156 @@ async def _observe(run_id: str, container: str, revision: str, probe,
         return detail
 
 
-async def _run_revision(run_id: str, context: dict, revision: str, probes: list) -> list[dict]:
-    if not probes:
-        return []
-    source_key = "source_path" if revision == "head" else "base_source_path"
+@asynccontextmanager
+async def prepare_runtime(run_id: str, context: dict, revision: str, probes: list):
+    """Own a runtime independently of its probes and always release its resources."""
+    source_key = "base_source_path" if revision == "base" else "source_path"
     source_text = context.get(source_key)
     source = Path(source_text).resolve() if source_text else None
+    state = {"container": "", "origin": "", "environment": _test_environment(context.get("analysis", {})), "setup_error": "",
+             "app_error": "", "browser_error": "", "dependencies_ready": False,
+             "services_ready": False, "analysis": context.get("analysis", {})}
     if not source or not source.is_dir():
-        return [{"probe_id": item.id, "expectation_id": item.expectation_id,
-                 "revision": revision, "kind": item.kind, "status": "blocked",
-                 "error": "Pinned source snapshot unavailable"} for item in probes]
+        state["setup_error"] = "Pinned source snapshot unavailable"
+        emit(run_id, "runtime", "failed", agent="runner", node=f"{revision}_setup",
+             success=False, detail={"error": state["setup_error"]})
+        yield state
+        return
     analysis = context["analysis"]
     setup_prefix = f"review/runtime/{revision}/setup-{context.get('runtime_environment_id', 'default')}"
     suffix = uuid4().hex[:8]
     container = f"ardberg-review-{revision}-{suffix}"
     network = f"{container}-net"
     database = f"{container}-postgres"
-    started = False
-    network_started = False
-    database_started = False
-    observations = []
+    state["container"] = container
+    started = network_started = database_started = False
     processes = []
     try:
-        emit(run_id, "runtime", "running", agent="runner", node=f"{revision}_setup")
-        code, output = await _command("docker", "run", "-d", "--name", container,
-                                      "--network", "bridge", "--workdir", "/workspace",
-                                      "--memory", settings.runner_memory,
-                                      "--cpus", settings.runner_cpus,
-                                      "--pids-limit", str(settings.runner_pids_limit),
-                                      "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
-                                      settings.docker_image, "sleep", "infinity", timeout=60)
-        if code:
-            raise RuntimeError(f"Could not create runtime container: {output}")
-        started = True
-        code, output = await _command("docker", "cp", str(source) + os.sep + ".",
-                                      f"{container}:/workspace", timeout=180)
-        if code:
-            raise RuntimeError(f"Could not copy pinned source: {output}")
-        install_commands, runtime_fixtures = _setup_phases(analysis, source)
-        for index, command in enumerate(install_commands):
-            await _run_setup_with_repair(
-                run_id, stage="runtime", agent="runner", node=f"{revision}_install_{index + 1}",
-                container=container, command=command,
-                log_prefix=f"{setup_prefix}/install-{index + 1}",
-                workspace=source,
-                environment={"NPM_CONFIG_REGISTRY": settings.npm_registry_url,
-                             "PIP_INDEX_URL": settings.pip_index_url},
-                instruction=context.get("instruction", ""),
-            )
-        browser_probes = [item for item in probes if item.kind == "browser"]
-        browser_error = ""
-        if browser_probes:
-            code, output = await _command("docker", "exec", "-e",
-                                          f"NPM_CONFIG_REGISTRY={settings.npm_registry_url}",
-                                          container, "sh", "-lc",
-                                          "npm install --no-save --prefix /tmp/ardberg-probe @playwright/test@1.63.0",
-                                          timeout=180)
+        try:
+            emit(run_id, "runtime", "running", agent="runner", node=f"{revision}_setup")
+            code, output = await _command("docker", "run", "-d", "--name", container,
+                                          "--network", "bridge", "--workdir", "/workspace",
+                                          "--memory", settings.runner_memory,
+                                          "--cpus", settings.runner_cpus,
+                                          "--pids-limit", str(settings.runner_pids_limit),
+                                          "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+                                          settings.docker_image, "sleep", "infinity", timeout=60)
             if code:
-                browser_error = f"Browser probe dependency unavailable: {output[-1000:]}"
-            else:
-                # Repository installers can garbage-collect the image's browser cache.
-                # Verify/install the helper's own exact browser before network isolation.
-                code, output = await _command("docker", "exec", container, "node",
-                    "/tmp/ardberg-probe/node_modules/@playwright/test/cli.js", "install", "chromium", timeout=180)
-                path = write_artifact(run_id, f"{setup_prefix}/browser-install.log", output)
-                emit(run_id, "runtime", "artifact", agent="runner", node=f"{revision}_browser",
-                     detail={"path": path, "exit_code": code})
+                raise RuntimeError(f"Could not create runtime container: {output}")
+            started = True
+            code, output = await _command("docker", "cp", str(source) + os.sep + ".",
+                                          f"{container}:/workspace", timeout=180)
+            if code:
+                raise RuntimeError(f"Could not copy pinned source: {output}")
+            for runtime, expected in analysis.get("runtime_versions", {}).items():
+                binary = "python" if runtime == "python" else "node"
+                code, actual = await _command("docker", "exec", container, binary, "--version", timeout=20)
+                version = actual.strip().removeprefix("Python ").removeprefix("v")
+                if code or not (version == expected or version.startswith(expected + ".")):
+                    raise RuntimeError(f"{runtime} requires {expected}; runner provides {version}")
+            install_commands, runtime_fixtures = _setup_phases(analysis, source)
+            state["install_commands"] = install_commands
+            for index, command in enumerate(install_commands):
+                await _run_setup_with_repair(
+                    run_id, stage="runtime", agent="runner", node=f"{revision}_install_{index + 1}",
+                    container=container, command=command,
+                    log_prefix=f"{setup_prefix}/install-{index + 1}",
+                    workspace=source,
+                    environment={"NPM_CONFIG_REGISTRY": settings.npm_registry_url,
+                                 "PIP_INDEX_URL": settings.pip_index_url},
+                    instruction=context.get("instruction", ""),
+                )
+            browser_probes = [item for item in probes if item.kind == "browser"]
+            browser_error = ""
+            if browser_probes:
+                code, output = await _command("docker", "exec", "-e",
+                                              f"NPM_CONFIG_REGISTRY={settings.npm_registry_url}",
+                                              container, "sh", "-lc",
+                                              "npm install --no-save --prefix /tmp/ardberg-probe @playwright/test@1.63.0",
+                                              timeout=180)
                 if code:
-                    browser_error = f"Browser helper executable unavailable; see {path}"
-                resource = Path(__file__).parent / "resources" / "runtime_probe.cjs"
-                code, output = await _command("docker", "cp", str(resource),
-                                              f"{container}:/tmp/ardberg-runtime-probe.cjs",
-                                              timeout=30)
-                if code:
-                    browser_error = f"Could not install browser probe: {output}"
-        code, output = await _command("docker", "network", "create", "--internal", network,
-                                      timeout=30)
-        if code:
-            raise RuntimeError(f"Could not create private runtime network: {output}")
-        network_started = True
-        code, output = await _command("docker", "network", "connect", network, container,
-                                      timeout=30)
-        if code:
-            raise RuntimeError(f"Could not connect runtime container: {output}")
-        code, output = await _command("docker", "network", "disconnect", "bridge", container,
-                                      timeout=30)
-        if code:
-            raise RuntimeError(f"Could not isolate runtime container: {output}")
-        services = analysis.get("services", [])
-        if services:
-            if len(services) != 1 or services[0]["kind"] != "postgres":
-                raise RuntimeError("Runtime review supports one disposable PostgreSQL service")
-            password = secrets.token_urlsafe(24)
-            database_started = True
-            await _start_postgres(run_id, network, database, password,
-                                  stage="runtime", agent="runner",
-                                  image=_postgres_image(source, services[0]),
-                                  node=f"{revision}_postgres")
-        else:
-            password = None
-        environment = _test_environment(analysis, password)
-        setup_commands = list(dict.fromkeys([
-            *(command for service in services for command in service.get("setup_commands", [])),
-            *runtime_fixtures,
-        ]))
-        for index, command in enumerate(setup_commands):
-            await _run_setup_with_repair(
-                run_id, stage="runtime", agent="runner", node=f"{revision}_service_{index + 1}",
-                container=container, command=command,
-                log_prefix=f"{setup_prefix}/service-{index + 1}",
-                workspace=source, environment=environment, network_isolated=True,
-                instruction=context.get("instruction", ""),
-            )
-        needs_app = any(item.kind in {"http", "browser"} for item in probes)
-        start = (analysis.get("interactive_preview_command") or
-                 analysis.get("app_start_command") or "").strip()
-        ready = (analysis.get("interactive_preview_ready_url") or
-                 analysis.get("app_ready_url") or "").strip()
-        origin = ""
-        app_error = ""
-        processes = analysis.get("runtime_processes", [])
-        if needs_app or processes:
-            if "runtime_processes" not in analysis and start and ready:
-                processes = [{"command": start, "ready_url": ready}]
-            environment.update({"HOST": "0.0.0.0", "HOSTNAME": "0.0.0.0"})
-            origin, app_error = await _start_processes(
-                run_id, container, revision, processes,
-                analysis.get("runtime_target_url") or ready, environment, setup_prefix)
-        emit(run_id, "runtime", "failed" if app_error else "passed", agent="runner", node=f"{revision}_setup",
-             success=not bool(app_error), detail={"origin": origin, "app_error": app_error,
-                                   "browser_error": browser_error})
-        for probe in probes:
-            blocker = (browser_error if probe.kind == "browser" else "") or (
-                app_error if probe.kind in {"http", "browser"} or processes else ""
-            )
-            if blocker:
-                detail = {"probe_id": probe.id, "expectation_id": probe.expectation_id,
-                          "revision": revision, "kind": probe.kind,
-                          "status": "blocked", "error": blocker}
-                emit(run_id, "runtime", "not_selected", agent="runner", node=probe.id,
-                     detail=detail)
-                observations.append(detail)
+                    browser_error = f"Browser probe dependency unavailable: {output[-1000:]}"
+                else:
+                    # Repository installers can garbage-collect the image's browser cache.
+                    # Verify/install the helper's own exact browser before network isolation.
+                    code, output = await _command("docker", "exec", container, "node",
+                        "/tmp/ardberg-probe/node_modules/@playwright/test/cli.js", "install", "chromium", timeout=180)
+                    path = write_artifact(run_id, f"{setup_prefix}/browser-install.log", output)
+                    emit(run_id, "runtime", "artifact", agent="runner", node=f"{revision}_browser",
+                         detail={"path": path, "exit_code": code})
+                    if code:
+                        browser_error = f"Browser helper executable unavailable; see {path}"
+                    resource = Path(__file__).parent / "resources" / "runtime_probe.cjs"
+                    code, output = await _command("docker", "cp", str(resource),
+                                                  f"{container}:/tmp/ardberg-runtime-probe.cjs",
+                                                  timeout=30)
+                    if code:
+                        browser_error = f"Could not install browser probe: {output}"
+            code, output = await _command("docker", "network", "create", "--internal", network,
+                                          timeout=30)
+            if code:
+                raise RuntimeError(f"Could not create private runtime network: {output}")
+            network_started = True
+            code, output = await _command("docker", "network", "connect", network, container,
+                                          timeout=30)
+            if code:
+                raise RuntimeError(f"Could not connect runtime container: {output}")
+            code, output = await _command("docker", "network", "disconnect", "bridge", container,
+                                          timeout=30)
+            if code:
+                raise RuntimeError(f"Could not isolate runtime container: {output}")
+            state["dependencies_ready"] = True
+            services = analysis.get("services", [])
+            if services:
+                if len(services) != 1 or services[0]["kind"] != "postgres":
+                    raise RuntimeError("Runtime review supports one disposable PostgreSQL service")
+                password = secrets.token_urlsafe(24)
+                database_started = True
+                await _start_postgres(run_id, network, database, password,
+                                      stage="runtime", agent="runner",
+                                      image=_postgres_image(source, services[0]),
+                                      node=f"{revision}_postgres")
             else:
-                observations.append(await _observe(run_id, container, revision, probe,
-                                                   origin, environment))
-        return observations
-    except Exception as exc:
-        emit(run_id, "runtime", "failed", agent="runner", node=f"{revision}_setup",
-             success=False, detail={"error": str(exc)})
-        return [{"probe_id": item.id, "expectation_id": item.expectation_id,
-                 "revision": revision, "kind": item.kind, "status": "blocked",
-                 "error": str(exc)} for item in probes]
+                password = None
+            environment = _test_environment(analysis, password)
+            state["environment"] = environment
+            setup_commands = list(dict.fromkeys([
+                *(command for service in services for command in service.get("setup_commands", [])),
+                *runtime_fixtures,
+            ]))
+            for index, command in enumerate(setup_commands):
+                await _run_setup_with_repair(
+                    run_id, stage="runtime", agent="runner", node=f"{revision}_service_{index + 1}",
+                    container=container, command=command,
+                    log_prefix=f"{setup_prefix}/service-{index + 1}",
+                    workspace=source, environment=environment, network_isolated=True,
+                    instruction=context.get("instruction", ""),
+                )
+            state["services_ready"] = True
+            needs_app = any(item.kind in {"http", "browser"} for item in probes)
+            start = (analysis.get("interactive_preview_command") or
+                     analysis.get("app_start_command") or "").strip()
+            ready = (analysis.get("interactive_preview_ready_url") or
+                     analysis.get("app_ready_url") or "").strip()
+            origin = ""
+            app_error = ""
+            processes = analysis.get("runtime_processes", [])
+            if needs_app or processes:
+                if "runtime_processes" not in analysis and start and ready:
+                    processes = [{"command": start, "ready_url": ready}]
+                environment.update({"HOST": "0.0.0.0", "HOSTNAME": "0.0.0.0"})
+                origin, app_error = await _start_processes(
+                    run_id, container, revision, processes,
+                    analysis.get("runtime_target_url") or ready, environment, setup_prefix)
+            state.update(origin=origin, environment=environment, app_error=app_error, browser_error=browser_error)
+            emit(run_id, "runtime", "failed" if app_error else "passed", agent="runner", node=f"{revision}_setup",
+                 success=not bool(app_error), detail={"origin": origin, "app_error": app_error,
+                                       "browser_error": browser_error})
+        except Exception as exc:
+            state["setup_error"] = str(exc)
+            emit(run_id, "runtime", "failed", agent="runner", node=f"{revision}_setup",
+                 success=False, detail={"error": str(exc)})
+        yield state
     finally:
         if started:
             try:
@@ -344,7 +353,31 @@ async def _run_revision(run_id: str, context: dict, revision: str, probes: list)
                 pass
 
 
-async def run_runtime_probes(run_id: str, context: dict, plan) -> dict:
+async def observe_prepared(run_id: str, state: dict, revision: str, probes: list) -> list[dict]:
+    observations = []
+    for probe in probes:
+        blocker = state["setup_error"] or (state["browser_error"] if probe.kind == "browser" else "") or (
+            state["app_error"] if probe.kind in {"http", "browser"} or
+            state["analysis"].get("runtime_processes") else "")
+        if blocker:
+            detail = {"probe_id": probe.id, "expectation_id": probe.expectation_id,
+                      "revision": revision, "kind": probe.kind, "status": "blocked", "error": blocker}
+            emit(run_id, "runtime", "not_selected", agent="runner", node=probe.id, detail=detail)
+            observations.append(detail)
+        else:
+            observations.append(await _observe(run_id, state["container"], revision, probe,
+                                               state["origin"], state["environment"]))
+    return observations
+
+
+async def _run_revision(run_id: str, context: dict, revision: str, probes: list) -> list[dict]:
+    if not probes:
+        return []
+    async with prepare_runtime(run_id, context, revision, probes) as state:
+        return await observe_prepared(run_id, state, revision, probes)
+
+
+async def run_runtime_probes(run_id: str, context: dict, plan, prepared=None) -> dict:
     base, head = [], []
     environments = {item.id: item for item in plan.environments}
     inherited = {_setup_key(command) for command in context["analysis"].get("install_commands", [])}
@@ -382,7 +415,12 @@ async def run_runtime_probes(run_id: str, context: dict, plan) -> dict:
         else:
             analysis["runtime_setup_commands"] = analysis.get("interactive_preview_setup_commands", [])
         scoped = {**context, "analysis": analysis, "runtime_environment_id": key}
+        reusable = prepared and can_reuse(prepared, analysis, probes)
+        if reusable:
+            emit(run_id, "runtime", "passed", agent="runner", node="head_setup", success=True,
+                 detail={"reused_baseline": True, "environment_id": key})
         head_result, base_result = await asyncio.gather(
+            observe_prepared(run_id, prepared, "head", probes) if reusable else
             _run_revision(run_id, scoped, "head", probes),
             _run_revision(run_id, scoped, "base", [p for p in probes if p.compare_base]),
         )
@@ -401,3 +439,20 @@ async def run_runtime_probes(run_id: str, context: dict, plan) -> dict:
          detail={"path": path})
     result["artifact"] = path
     return result
+
+
+def can_reuse(state: dict, analysis: dict, probes: list) -> bool:
+    """Reuse only equivalent ready environments; never apply a PR recipe to base."""
+    if state["setup_error"] or state["app_error"] or not state["container"]:
+        return False
+    # Browser helpers are provisioned separately by the focused browser environment.
+    if any(p.kind == "browser" for p in probes):
+        return False
+    baseline = state["analysis"]
+    if not {_setup_key(c) for c in analysis.get("install_commands", [])} <= {
+            _setup_key(c) for c in baseline.get("install_commands", [])}:
+        return False
+    for key in ("services", "runtime_processes", "runtime_setup_commands", "test_environment"):
+        if analysis.get(key, []) != baseline.get(key, []):
+            return False
+    return analysis.get("runtime_target_url", "") == baseline.get("runtime_target_url", "")

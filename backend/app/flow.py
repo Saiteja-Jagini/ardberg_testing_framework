@@ -17,9 +17,12 @@ def review_definition(run: dict | None, events: list[dict]) -> dict:
     edges = []
     def add(node_id: str, label: str, x: int, y: int, group: str, description: str):
         event = latest.get(node_id)
+        status = event["status"] if event else "not_started"
+        if event and node_id.endswith("_setup") and (event.get("detail") or {}).get("app_error"):
+            status = "failed"
         nodes.append({"id": node_id, "label": label, "x": x, "y": y,
                       "group": group, "description": description,
-                      "status": event["status"] if event else "not_started", "event": event})
+                      "status": status, "event": event})
     def link(source: str, target: str, label: str = ""):
         edges.append({"id": f"{source}->{target}", "source": source,
                       "target": target, "label": label})
@@ -60,11 +63,31 @@ def review_definition(run: dict | None, events: list[dict]) -> dict:
             nodes[-1]["status"] = "not_selected"
         link(previous, node_id)
         previous = node_id
+    if run is None or "runner.baseline_config" in latest:
+        add("runner.baseline_config", "Repository setup recipe", 560, -200, "executor",
+            "Resolve pinned configuration or manifest defaults without waiting for AI planning.")
+        add("runner.baseline_head_setup", "Independent environment setup", 1000, -200, "executor",
+            "Install dependencies, prepare configured services and check application readiness.")
+        add("runner.native_checks", "Existing tests and build checks", 1500, -200, "runtime",
+            "Run declared checks even when focused planning fails. These do not establish PR-specific coverage.")
+        link("preflight.fetch_repository", "runner.baseline_config", "independent of AI")
+        link("runner.baseline_config", "runner.baseline_head_setup")
+        link("runner.baseline_head_setup", "runner.native_checks")
+        link("runner.native_checks", "runner.head_setup", "reuse compatible runtime")
+        link("runner.native_checks", "evidence_critic.classify", "native results and blockers")
+        setup_names = list(dict.fromkeys(e["node"] for e in events
+                          if (e.get("node") or "").startswith("baseline_head_") and
+                          e["node"] != "baseline_head_setup" and e["status"] != "artifact"))
+        for index, name in enumerate(setup_names):
+            add(f"runner.{name}", name.removeprefix("baseline_head_").replace("_", " ").title(),
+                1000 + index * 280, -440, "executor", "Recorded setup step and its actual outcome.")
+            link("runner.baseline_head_setup", f"runner.{name}", "setup detail")
     probe_events = [event for event in events if event["stage"] == "runtime"
                     and event["agent"] == "runner" and event["node"]
-                    and event["node"] not in {"head_setup", "base_setup"}
+                    and event["node"] not in {"head_setup", "base_setup", "collect"}
+                    and event["status"] != "artifact"
                     and not event["node"].startswith(("head_install_", "base_install_",
-                                                       "head_service_", "base_service_"))]
+                                                       "head_service_", "base_service_", "baseline_", "native_"))]
     for index, name in enumerate(dict.fromkeys(event["node"] for event in probe_events)):
         node_id = f"runner.{name}"
         add(node_id, f"Probe {name}", 2850, 570 + index * 135, "runtime",

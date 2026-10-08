@@ -13,6 +13,7 @@ with workflow.unsafe.imports_passed_through():
     from .publication import publish_generated_tests
     from .report import generate_report, publish_report
     from .review import run_review
+    from .baseline import run_independent_review
     from .runner import execute_tests
 
 
@@ -39,6 +40,20 @@ async def preflight_activity(run_id: str) -> dict:
                    and item["status"] == "running" and item["node"]]
         node = running[-1]["node"] if running else "preflight"
         emit(run_id, "preflight", "failed", node=node, success=False,
+             detail={"error": str(exc)})
+        return {"_failed": str(exc)}
+
+
+@activity.defn
+async def pin_review_activity(run_id: str) -> dict:
+    """Fetch source only so no model failure can prevent baseline setup."""
+    saved = get_run(run_id)
+    if saved["context"].get("resume_source_review"):
+        return await preflight_activity(run_id)
+    try:
+        return await prepare_run(run_id, pinned_only=True)
+    except Exception as exc:
+        emit(run_id, "preflight", "failed", node="fetch_repository", success=False,
              detail={"error": str(exc)})
         return {"_failed": str(exc)}
 
@@ -92,8 +107,8 @@ async def status_activity(run_id: str, status: str, stage: str, error: str = "")
 @activity.defn
 async def review_activity(run_id: str, context: dict) -> dict:
     set_run(run_id, stage="review")
-    outcome = await run_review(run_id, context)
-    set_run(run_id, context={**context, "review_verdict": outcome["verdict"]})
+    outcome = await run_independent_review(run_id, context)
+    set_run(run_id, context={**get_run(run_id)["context"], "review_verdict": outcome["verdict"]})
     return outcome
 
 
@@ -107,7 +122,8 @@ class ReviewWorkflow:
                    "error": "Review did not start"}
         try:
             context = await workflow.execute_activity(
-                preflight_activity, run_id, start_to_close_timeout=timedelta(minutes=10),
+                pin_review_activity if workflow.patched("independent-baseline-v1") else preflight_activity,
+                run_id, start_to_close_timeout=timedelta(minutes=10),
                 retry_policy=NO_RETRY,
             )
             if context.get("_failed"):

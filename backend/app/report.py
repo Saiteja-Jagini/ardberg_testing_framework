@@ -99,6 +99,26 @@ def _execution_record(outcome: dict, events: list[dict]) -> str:
         counts = [sum(o["status"] == status for o in selected) for status in ("observed", "failed", "blocked")]
         lines.append(f"| {revision} | {counts[0]} | {counts[1]} | {counts[2]} |")
     lines += ["", "Observed means the probe executed and produced evidence; it does not mean every requirement passed.", ""]
+    baseline = outcome.get("runtime", {}).get("baseline")
+    if baseline:
+        lines += ["### Independent environment setup", "",
+                  f"Configuration: `{baseline.get('configuration') or 'unavailable'}`. "
+                  f"Setup: **{baseline['status']}**.", "",
+                  "| Dependencies | Services | Application readiness |",
+                  "| --- | --- | --- |",
+                  f"| {baseline.get('dependencies', 'blocked')} | {baseline.get('services', 'blocked')} | "
+                  f"{baseline.get('application', 'blocked')} |", ""]
+        if baseline.get("error"):
+            lines += [baseline["error"], ""]
+        lines += ["### Repository-native checks", "",
+                  "These results are separate from focused PR behavior coverage.", "",
+                  "| Check | Kind | Result | Evidence |", "| --- | --- | --- | --- |"]
+        for check in baseline.get("checks", []):
+            log = f"[log]({check['log']})" if check.get("log") else "Not executed"
+            lines.append(f"| {check['name']} | {check['kind']} | {check['status']} | {log} |")
+        if not baseline.get("checks"):
+            lines += ["| None declared | — | Not run | — |"]
+        lines += ["", *[f"- {gap}" for gap in baseline.get("gaps", [])], ""]
     for event in _current_attempt_events(events):
         detail = event.get("detail") or {}
         if event.get("stage") == "runtime" and event.get("status") in {"passed", "failed"} and detail.get("command"):
@@ -276,7 +296,9 @@ def classify_failure(events: list[dict]) -> list[dict]:
             rule = ("Human-recorded outcome" if event["agent"] == "reviewer"
                     else "Interactive preview did not start or stop cleanly")
         elif stage == "runtime":
-            category = ("runtime_setup_failure" if (event["node"] or "").endswith("_setup")
+            category = ("native_check_failure" if (event["node"] or "").startswith("native_") else
+                        "runtime_setup_failure" if (event["node"] or "").endswith("_setup") or
+                        (event["node"] or "").startswith("baseline_")
                         else "runtime_probe_failure")
             rule = "Disposable runtime stage failed; inspect the probe output and setup logs"
         elif stage == "security":
@@ -398,6 +420,10 @@ async def generate_report(run_id: str, outcome: dict) -> str:
     prompt += ("\nEvents outside current_attempt_event_ids are historical evidence. "
                "A retry supersedes their execution results; do not present earlier setup "
                "or probe failures as blockers for this attempt.")
+    prompt += ("\nIndependent baseline setup and native checks are recorded in runtime.baseline. "
+               "They can execute even if AI analysis or focused planning fails. Report their "
+               "actual results separately from focused PR coverage. Never convert a native "
+               "suite pass into verification of an unexercised PR requirement.")
     for attempt in range(3):
         emit(run_id, "report", "running", agent="report", node="write_analysis",
              detail={"attempt": attempt + 1})
